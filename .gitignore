@@ -1,0 +1,90 @@
+# ---------------------------------------------------------------------------
+# VIDSGEN .gitignore
+# Hard rules: no model weights, no secrets, no generated media in Git.
+# scripts/check_repo_hygiene.sh enforces the same rules on tracked files.
+# ---------------------------------------------------------------------------
+
+# --- Earlier from-scratch prototype (kept locally, intentionally untracked) ---
+/src/
+
+# --- Secrets ---------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+kaggle.json
+.huggingface/
+hf_token*
+
+# --- Model weights & checkpoints (download via scripts, never commit) -------
+/models/
+/checkpoints/
+/backend/models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.gguf
+*.onnx
+
+# --- Generated media & runtime storage ---------------------------------------
+/storage/
+/outputs/
+/uploads/
+/backend/storage/
+/backend/outputs/
+/backend/uploads/
+*.mp4
+*.webm
+*.mov
+*.mkv
+*.avi
+*.gif
+# Allow small, intentional docs images only under docs/assets/
+*.png
+*.jpg
+*.jpeg
+*.webp
+!docs/assets/**
+
+# --- Local databases ----------------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+
+# --- ComfyUI checkouts (installed at runtime, not vendored) -------------------
+/ComfyUI/
+/comfyui/
+/notebooks/ComfyUI/
+
+# --- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# --- Node / frontend ----------------------------------------------------------
+node_modules/
+frontend/dist/
+.vite/
+npm-debug.log*
+
+# --- Notebooks ----------------------------------------------------------------
+.ipynb_checkpoints/
+
+# --- Editors / OS -------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
