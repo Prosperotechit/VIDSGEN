@@ -13,9 +13,11 @@ export interface paths {
         };
         /**
          * Service health
-         * @description Always returns 200 while the API is up. `status` is `degraded` when the
-         *     inference provider or storage is unavailable (e.g. the GPU host is offline);
-         *     jobs can still be submitted and will wait in the queue.
+         * @description Always returns 200 while the API is up. `status` is `degraded` when the inference
+         *     provider or storage cannot accept work (e.g. the GPU host is offline, or its model files
+         *     are missing or have the wrong size). `provider.checks` reports each aspect separately;
+         *     for a GPU provider, weight integrity and inference stay "unverified" until a real
+         *     generation has succeeded, so `ok` never claims inference readiness.
          */
         get: operations["health_api_health_get"];
         put?: never;
@@ -158,13 +160,21 @@ export interface components {
         ComponentHealth: {
             /** Name */
             name: string;
-            /** Ok */
+            /**
+             * Ok
+             * @description Whether the component can accept work now. For a GPU provider this does NOT mean inference is verified; see checks.
+             */
             ok: boolean;
             /**
              * Detail
              * @default
              */
             detail: string;
+            /**
+             * Checks
+             * @description Separately reported aspects (may be empty)
+             */
+            checks?: components["schemas"]["HealthCheckOut"][];
         };
         /** ErrorDetail */
         ErrorDetail: {
@@ -186,6 +196,25 @@ export interface components {
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /** HealthCheckOut */
+        HealthCheckOut: {
+            /**
+             * Name
+             * @description e.g. comfyui_reachable, model_files_detected, model_file_sizes, model_weights_integrity, inference
+             */
+            name: string;
+            /**
+             * Status
+             * @description 'unverified' = could not be established, not a failure
+             * @enum {string}
+             */
+            status: "ok" | "failed" | "unverified";
+            /**
+             * Detail
+             * @default
+             */
+            detail: string;
         };
         /** HealthOut */
         HealthOut: {

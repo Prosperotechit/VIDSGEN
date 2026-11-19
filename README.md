@@ -58,7 +58,7 @@ Wan 2.2 TI2V-5B: one 5B model for both text-to-video and image-to-video, native
 | 1 | Repository scaffolding, docs, model manifest | ✅ |
 | 2 | Backend: jobs API, progress, provider interface, mock provider, local storage, tests | ✅ |
 | 3 | Frontend: T2V/I2V forms, progress, preview, download, history | ✅ |
-| 4 | ComfyUI provider, workflow templates, model download script | ⏳ |
+| 4 | ComfyUI provider, workflow templates, model download script | ✅ |
 | 5 | Kaggle notebook: ComfyUI + token proxy + Cloudflare quick tunnel, T4 verification | ⏳ |
 | 6 | End-to-end T2V and I2V validation | ⏳ |
 

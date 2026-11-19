@@ -47,13 +47,16 @@ app/
 │   ├── base.py          InferenceProvider interface (submit/progress/fetch_result/cancel/health)
 │   ├── mock.py          MockProvider: simulated steps, real MP4 output, failure trigger
 │   ├── mock_video.py    Synthesises H.264 MP4s with ffmpeg (bundled via imageio-ffmpeg)
+│   ├── comfyui.py       ComfyUIProvider: upload, /prompt, WebSocket progress, /history, /view, cancel, health
 │   └── __init__.py      build_provider(): picks provider from INFERENCE_PROVIDER
 ├── storage/
 │   ├── base.py          Storage interface + key validation (keys, never paths, in job records)
 │   ├── local.py         LocalStorage: atomic writes, path-traversal safe
 │   └── __init__.py      build_storage(): picks backend from STORAGE_BACKEND
-└── workflows/           ComfyUI template loading (Phase 4)
-tests/                   91 tests: API, lifecycle, validation, failures, cancellation, storage
+└── workflows/
+    └── templates.py     Loads + validates the ComfyUI templates and mapping; builds a graph per job
+tests/                   API, lifecycle, validation, failures, cancellation, storage, contract,
+                         ComfyUI workflows/provider (fake server), live ComfyUI checks (opt-in)
 ```
 
 ## How the pieces relate
@@ -61,7 +64,7 @@ tests/                   91 tests: API, lifecycle, validation, failures, cancell
 ```
 HTTP request ─▶ api/jobs.py ─▶ JobManager ─┬─▶ JobRepository (SQLite)   job records, status, progress
                                             ├─▶ Storage (local → S3)     uploads/<id>/input.png, outputs/<id>/video.mp4
-                                            └─▶ InferenceProvider        mock now, ComfyUI in Phase 4
+                                            └─▶ InferenceProvider        mock (default) or ComfyUI
 ```
 
 1. `POST /api/jobs` validates input, stores the image (I2V), inserts the job (`queued`) and
@@ -71,6 +74,18 @@ HTTP request ─▶ api/jobs.py ─▶ JobManager ─┬─▶ JobRepository (SQ
 3. On success the video is copied from the provider into Storage, and only then does the job
    become `completed` at 100 %. Errors become `failed` with an error code. A cancel request
    becomes `cancelled` and the provider is told to stop.
+
+## Using ComfyUI instead of the mock
+
+```dotenv
+INFERENCE_PROVIDER=comfyui
+COMFYUI_BASE_URL=https://<gpu-host-or-tunnel>
+COMFYUI_API_TOKEN=<shared secret>
+```
+
+See [../docs/PROVIDERS.md](../docs/PROVIDERS.md) and [../workflows/comfyui/README.md](../workflows/comfyui/README.md).
+Live checks against a real ComfyUI (skipped unless set):
+`VIDSGEN_COMFYUI_LIVE_URL=http://127.0.0.1:8188 .venv/bin/python -m pytest tests/test_comfyui_live.py`
 
 ## Mock provider test hooks
 

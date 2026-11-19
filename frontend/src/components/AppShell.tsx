@@ -14,7 +14,7 @@ function healthText(h: HealthState): { tone: string; text: string } {
   switch (h.kind) {
     case "loading": return { tone: "neutral", text: "Connecting…" };
     case "ok": return { tone: "ok", text: h.health.provider.name === "mock" ? "Online · mock GPU" : "Online" };
-    case "degraded": return { tone: "warn", text: "GPU offline · jobs will queue" };
+    case "degraded": return { tone: "warn", text: "GPU server not ready · see Settings" };
     case "offline": return { tone: "danger", text: "API unreachable" };
   }
 }

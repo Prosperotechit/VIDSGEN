@@ -72,10 +72,27 @@ class ProviderResult:
             pass
 
 
+CheckStatus = Literal["ok", "failed", "unverified"]
+
+
+@dataclass(frozen=True)
+class HealthCheck:
+    """One separately reported aspect of provider health.
+
+    "unverified" means the provider could not establish it (not that it failed): for
+    example, model weight integrity cannot be checked through ComfyUI's API.
+    """
+
+    name: str
+    status: CheckStatus
+    detail: str = ""
+
+
 @dataclass(frozen=True)
 class ProviderHealth:
-    ok: bool
-    detail: str = ""
+    ok: bool                              # can the provider accept work right now?
+    detail: str = ""                      # one-line, honest summary
+    checks: tuple[HealthCheck, ...] = ()  # optional breakdown (providers may leave it empty)
 
 
 class ProviderError(Exception):

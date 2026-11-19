@@ -1,0 +1,30 @@
+{
+  "_comment": "Written by workflows/comfyui/tools/export_api_workflows.mjs. Records exactly what the templates were exported from.",
+  "official_workflow": {
+    "repo": "Comfy-Org/workflow_templates",
+    "path": "templates/video_wan2_2_5B_ti2v.json",
+    "sha256": "8f761d02dfd52fb769249cf240d04bdfb23c8bd722662828572362b98fc77ec6",
+    "saved_with_frontend": "1.27.10"
+  },
+  "exported_with": {
+    "comfyui_version": "0.46.0",
+    "frontend_version": "1.59.6"
+  },
+  "changes_from_official": [
+    "Node 56 (LoadImage) bypassed for t2v, enabled for i2v (as the official docs describe).",
+    "Node 58 (SaveVideo) format=mp4, format.codec=h264 (was auto) for browser-compatible output."
+  ],
+  "node_classes": [
+    "CLIPLoader",
+    "CLIPTextEncode",
+    "CreateVideo",
+    "KSampler",
+    "LoadImage",
+    "ModelSamplingSD3",
+    "SaveVideo",
+    "UNETLoader",
+    "VAEDecode",
+    "VAELoader",
+    "Wan22ImageToVideoLatent"
+  ]
+}

@@ -4,7 +4,7 @@ def test_health_ok(client):
     body = r.json()
     assert body["status"] == "ok"
     assert body["environment"] == "test"
-    assert body["provider"] == {"name": "mock", "ok": True, "detail": "mock provider ready (no GPU)"}
+    assert body["provider"] == {"name": "mock", "ok": True, "detail": "mock provider ready (no GPU)", "checks": []}
     assert body["storage"]["name"] == "local" and body["storage"]["ok"] is True
     assert set(body["jobs"]) == {"queued", "processing", "completed", "failed", "cancelled"}
 

@@ -1,0 +1,49 @@
+{
+  "_comment": "Maps VIDSGEN generation parameters onto the API-format templates exported from the official Comfy-Org Wan 2.2 5B TI2V workflow. Node ids come from the official workflow; the backend checks every id and class_type below at startup and refuses to run if a re-exported template no longer matches.",
+  "name": "wan22_ti2v_5b",
+  "templates": {
+    "t2v": "wan22_ti2v_5b_t2v.json",
+    "i2v": "wan22_ti2v_5b_i2v.json"
+  },
+  "nodes": {
+    "sampler":       { "id": "3",  "class_type": "KSampler" },
+    "positive":      { "id": "6",  "class_type": "CLIPTextEncode" },
+    "negative":      { "id": "7",  "class_type": "CLIPTextEncode" },
+    "decode":        { "id": "8",  "class_type": "VAEDecode" },
+    "unet_loader":   { "id": "37", "class_type": "UNETLoader" },
+    "clip_loader":   { "id": "38", "class_type": "CLIPLoader" },
+    "vae_loader":    { "id": "39", "class_type": "VAELoader" },
+    "model_sampling":{ "id": "48", "class_type": "ModelSamplingSD3" },
+    "latent":        { "id": "55", "class_type": "Wan22ImageToVideoLatent" },
+    "load_image":    { "id": "56", "class_type": "LoadImage", "modes": ["i2v"] },
+    "create_video":  { "id": "57", "class_type": "CreateVideo" },
+    "save_video":    { "id": "58", "class_type": "SaveVideo" }
+  },
+  "inputs": {
+    "prompt":          { "node": "positive",     "input": "text" },
+    "negative_prompt": { "node": "negative",     "input": "text" },
+    "width":           { "node": "latent",       "input": "width" },
+    "height":          { "node": "latent",       "input": "height" },
+    "num_frames":      { "node": "latent",       "input": "length" },
+    "fps":             { "node": "create_video", "input": "fps" },
+    "steps":           { "node": "sampler",      "input": "steps" },
+    "guidance_scale":  { "node": "sampler",      "input": "cfg" },
+    "seed":            { "node": "sampler",      "input": "seed" },
+    "image":           { "node": "load_image",   "input": "image", "modes": ["i2v"] },
+    "filename_prefix": { "node": "save_video",   "input": "filename_prefix" }
+  },
+  "i2v_link": { "node": "latent", "input": "start_image", "from": "load_image" },
+  "required_models": [
+    { "node": "unet_loader", "input": "unet_name", "folder": "diffusion_models", "file": "wan2.2_ti2v_5B_fp16.safetensors" },
+    { "node": "clip_loader", "input": "clip_name", "folder": "text_encoders",    "file": "umt5_xxl_fp8_e4m3fn_scaled.safetensors" },
+    { "node": "vae_loader",  "input": "vae_name",  "folder": "vae",              "file": "wan2.2_vae.safetensors" }
+  ],
+  "progress": {
+    "_comment": "Percent ranges reported to VIDSGEN. Only 'progress' events from the sampler node advance the step range.",
+    "started": 2,
+    "sampling": [5, 90],
+    "after_node": { "decode": 91, "create_video": 95, "save_video": 97 }
+  },
+  "output_node": "save_video",
+  "default_negative_prompt": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+}

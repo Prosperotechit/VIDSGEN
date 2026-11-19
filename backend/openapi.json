@@ -3,7 +3,7 @@
   "info": {
     "title": "VIDSGEN API",
     "description": "Video generation API for VIDSGEN (Wan 2.2 TI2V-5B).\n\nSubmit a text-to-video or image-to-video job, poll it for progress, then preview or download the MP4. The GPU backend is pluggable; this instance uses the provider shown by `/api/health`.",
-    "version": "0.2.0"
+    "version": "0.4.0"
   },
   "paths": {
     "/api/health": {
@@ -12,7 +12,7 @@
           "health"
         ],
         "summary": "Service health",
-        "description": "Always returns 200 while the API is up. `status` is `degraded` when the\ninference provider or storage is unavailable (e.g. the GPU host is offline);\njobs can still be submitted and will wait in the queue.",
+        "description": "Always returns 200 while the API is up. `status` is `degraded` when the inference\nprovider or storage cannot accept work (e.g. the GPU host is offline, or its model files\nare missing or have the wrong size). `provider.checks` reports each aspect separately;\nfor a GPU provider, weight integrity and inference stay \"unverified\" until a real\ngeneration has succeeded, so `ok` never claims inference readiness.",
         "operationId": "health_api_health_get",
         "responses": {
           "200": {
@@ -438,12 +438,21 @@
           },
           "ok": {
             "type": "boolean",
-            "title": "Ok"
+            "title": "Ok",
+            "description": "Whether the component can accept work now. For a GPU provider this does NOT mean inference is verified; see checks."
           },
           "detail": {
             "type": "string",
             "title": "Detail",
             "default": ""
+          },
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/HealthCheckOut"
+            },
+            "type": "array",
+            "title": "Checks",
+            "description": "Separately reported aspects (may be empty)"
           }
         },
         "type": "object",
@@ -503,6 +512,36 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "HealthCheckOut": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "e.g. comfyui_reachable, model_files_detected, model_file_sizes, model_weights_integrity, inference"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "failed",
+              "unverified"
+            ],
+            "title": "Status",
+            "description": "'unverified' = could not be established, not a failure"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "status"
+        ],
+        "title": "HealthCheckOut"
       },
       "HealthOut": {
         "properties": {

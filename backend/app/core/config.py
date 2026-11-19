@@ -41,8 +41,14 @@ class Settings(BaseSettings):
     inference_provider: Literal["mock", "comfyui"] = "mock"
     inference_timeout_seconds: float = Field(1800, gt=0)
     inference_max_concurrent_jobs: int = Field(1, ge=1, le=16)
-    comfyui_url: str = ""
-    comfyui_api_token: SecretStr = SecretStr("")
+
+    # ComfyUI provider (INFERENCE_PROVIDER=comfyui). Server-side only: never sent to the frontend.
+    comfyui_base_url: str = ""                       # e.g. https://<tunnel-host> or http://gpu-box:8188
+    comfyui_api_token: SecretStr = SecretStr("")     # sent as "Authorization: Bearer"; checked by the token proxy
+    comfyui_timeout: float = Field(30, gt=0, le=600)  # per HTTP request, seconds (whole job: INFERENCE_TIMEOUT_SECONDS)
+    comfyui_client_id: str = ""                      # empty = "vidsgen-<random>" per backend process
+    comfyui_poll_interval: float = Field(2.0, gt=0, le=60)  # status polling when WebSocket events are unavailable
+    comfyui_workflows_dir: Path = REPO_ROOT / "workflows" / "comfyui"
 
     # Mock provider tuning (development/tests only)
     mock_step_delay_seconds: float = Field(0.15, ge=0)
@@ -63,6 +69,21 @@ class Settings(BaseSettings):
     max_prompt_chars: int = Field(2000, ge=10, le=10000)
     min_image_side: int = Field(256, ge=16)
     max_image_side: int = Field(4096, ge=256)
+
+    @field_validator("comfyui_base_url", mode="after")
+    @classmethod
+    def _check_comfyui_url(cls, v: str) -> str:
+        v = v.strip().rstrip("/")
+        if v and not v.startswith(("http://", "https://")):
+            raise ValueError("COMFYUI_BASE_URL must start with http:// or https://")
+        return v
+
+    @field_validator("comfyui_workflows_dir", mode="before")
+    @classmethod
+    def _empty_workflows_dir(cls, v):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return REPO_ROOT / "workflows" / "comfyui"
+        return v
 
     @field_validator("storage_local_root", mode="before")
     @classmethod

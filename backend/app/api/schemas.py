@@ -82,10 +82,17 @@ class JobListOut(BaseModel):
     offset: int
 
 
+class HealthCheckOut(BaseModel):
+    name: str = Field(description="e.g. comfyui_reachable, model_files_detected, model_file_sizes, model_weights_integrity, inference")
+    status: Literal["ok", "failed", "unverified"] = Field(description="'unverified' = could not be established, not a failure")
+    detail: str = ""
+
+
 class ComponentHealth(BaseModel):
     name: str
-    ok: bool
+    ok: bool = Field(description="Whether the component can accept work now. For a GPU provider this does NOT mean inference is verified; see checks.")
     detail: str = ""
+    checks: list[HealthCheckOut] = Field(default_factory=list, description="Separately reported aspects (may be empty)")
 
 
 class HealthOut(BaseModel):

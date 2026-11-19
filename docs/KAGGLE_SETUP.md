@@ -26,7 +26,7 @@ must do and how T4 compatibility is verified (not assumed).
 5. Run the **T4 verification** and **workflow validation** below inside the notebook,
    before any remote access is opened.
 6. Start the token proxy in front of ComfyUI and a Cloudflare quick tunnel; print
-   the URL for `COMFYUI_URL`.
+   the URL for `COMFYUI_BASE_URL`.
 7. Stop the tunnel when testing ends. Nothing stays exposed after the session.
 
 ## T4 compatibility: facts and risks
@@ -62,12 +62,12 @@ resolution/duration** the backend allows when the provider is a T4.
 
 Each mode has its own workflow template and is validated on its own:
 
-**T2V** (`wan22_ti2v_5b_t2v.api.json`, no `start_image`)
+**T2V** (`wan22_ti2v_5b_t2v.json`, no `start_image`)
 - Same prompt + seed twice → identical output (determinism).
 - Output: expected width/height, frame count `4k+1`, 24 fps, playable H.264 MP4.
 - Prompt adherence spot-check on 3 fixed prompts.
 
-**I2V** (`wan22_ti2v_5b_i2v.api.json`, `start_image` connected)
+**I2V** (`wan22_ti2v_5b_i2v.json`, `start_image` connected)
 - First output frame visually matches the input image.
 - Landscape, portrait and square inputs: aspect handling and resizing are correct.
 - Missing or invalid image → clear error, not a silent fall-back to T2V.
@@ -78,6 +78,30 @@ then again through the tunnel from the backend.
 ## Limits to respect
 
 - About 30 GPU-hours/week; sessions max 12 h; idle sessions get stopped.
-- Tunnel URL changes every session, so update `COMFYUI_URL` each time.
+- Tunnel URL changes every session, so update `COMFYUI_BASE_URL` each time.
 - Kaggle discourages using notebooks as long-running public servers: open the tunnel
   only during active tests.
+
+## Ready from Phase 4
+
+- **Models:** `python scripts/download_models.py --comfyui-dir <ComfyUI>` prints the plan; add `--execute` in the
+  notebook to download (~18 GB). Set `HF_TOKEN` as a Kaggle Secret if needed.
+- **Backend:** `INFERENCE_PROVIDER=comfyui`, `COMFYUI_BASE_URL=<tunnel URL>`, `COMFYUI_API_TOKEN=<secret>`.
+- **First check against the GPU server** (read-only: health, models, templates vs that server's `/object_info`):
+
+  ```bash
+  cd backend && VIDSGEN_COMFYUI_LIVE_URL=<tunnel URL> VIDSGEN_COMFYUI_LIVE_TOKEN=<secret> .venv/bin/python -m pytest tests/test_comfyui_live.py
+  ```
+
+  Adding `VIDSGEN_COMFYUI_LIVE_SUBMIT=1` also runs two cheap, model-free graphs (output path + interrupt).
+
+## Still to prove in Phase 5 (not tested in Phase 4)
+
+- After the downloads, `/api/health` must show `model_file_sizes: ok`. `model_weights_integrity` and `inference`
+  stay `unverified` until the first real Wan generation completes; only that turns them `ok`.
+
+- Wan 2.2 TI2V-5B actually loads and samples on a T4 (fp16, no bf16), within VRAM and system RAM.
+- Real T2V and I2V output quality, real timings, and the T4 verification matrix above.
+- Whether full-size decode needs `VAEDecodeTiled` (the template currently uses the official `VAEDecode`).
+- Real progress cadence from the sampler, and behaviour through the Cloudflare tunnel and token proxy (WebSocket
+  included).
