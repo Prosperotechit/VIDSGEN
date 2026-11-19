@@ -1,0 +1,339 @@
+/* ---------------------------------------------------------------- generic page */
+.page {
+  max-width: 1280px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+
+.page--narrow {
+  max-width: 880px;
+}
+
+.page__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+
+.page__actions {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+.back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  align-self: flex-start;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+}
+
+.back-link:hover {
+  color: var(--text);
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-4);
+}
+
+/* ---------------------------------------------------------------- create */
+.create {
+  display: grid;
+  grid-template-columns: minmax(380px, 460px) minmax(0, 1fr);
+  gap: var(--sp-6);
+  align-items: start;
+  max-width: 1440px;
+  margin: 0 auto;
+}
+
+.create__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+
+.panel__head {
+  display: flex;
+  flex-direction: column;
+}
+
+.create__stage {
+  position: sticky;
+  top: var(--sp-8);
+  scroll-margin-top: 72px;
+}
+
+.stage-empty {
+  min-height: 420px;
+  display: grid;
+  place-items: center;
+  background:
+    radial-gradient(90% 60% at 50% 0%, rgba(240, 180, 90, 0.06), transparent 70%),
+    var(--surface);
+}
+
+.ideas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: calc(var(--sp-2) * -1);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding-top: var(--sp-5);
+  border-top: 1px solid var(--line);
+}
+
+.section--collapsible {
+  gap: 0;
+}
+
+.section--collapsible > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.section--collapsible > summary::-webkit-details-marker {
+  display: none;
+}
+
+.section--collapsible > summary::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 0.15s var(--ease);
+  margin-right: 4px;
+}
+
+.section--collapsible[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.section__summary {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: 0;
+  font-family: var(--font-body);
+  font-weight: 500;
+  color: var(--text-faint);
+}
+
+.section__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  padding-top: var(--sp-4);
+}
+
+.create__submit {
+  position: sticky;
+  bottom: calc(var(--sp-4) * -1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  margin: 0 calc(var(--sp-6) * -1) calc(var(--sp-6) * -1);
+  padding: var(--sp-4) var(--sp-6);
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 var(--r-xl) var(--r-xl);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  backdrop-filter: blur(10px);
+}
+
+.create__summary {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------- generations */
+.filters {
+  display: flex;
+  gap: var(--sp-2);
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding-bottom: 2px;
+}
+
+.filters::-webkit-scrollbar {
+  display: none;
+}
+
+.filters .chip {
+  flex: none;
+  font-size: var(--fs-sm);
+  padding: 6px 14px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--sp-4);
+}
+
+.load-more {
+  display: flex;
+  justify-content: center;
+}
+
+/* ---------------------------------------------------------------- job detail */
+.detail {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: var(--sp-6);
+  align-items: start;
+}
+
+.detail__side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.params {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.params__block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.params__label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-faint);
+}
+
+.params__prompt {
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  padding: var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--bg-elevated);
+  border: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+
+.params__prompt--muted {
+  color: var(--text-muted);
+}
+
+.params__id {
+  color: var(--text-faint);
+  font-size: 0.6875rem;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- settings */
+.settings-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.settings-card--muted {
+  background: transparent;
+  border-style: dashed;
+}
+
+/* ---------------------------------------------------------------- responsive */
+@media (max-width: 1099px) {
+  .create {
+    grid-template-columns: minmax(0, 1fr);
+    max-width: 760px;
+  }
+
+  .create__stage {
+    position: static;
+    order: 2;
+  }
+
+  .stage-empty {
+    min-height: 260px;
+  }
+
+  .detail {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 899px) {
+  .create__stage {
+    scroll-margin-top: 64px;
+  }
+}
+
+@media (max-width: 599px) {
+  .panel {
+    padding: var(--sp-4);
+    border-radius: var(--r-lg);
+  }
+
+  .page-title {
+    font-size: var(--fs-xl);
+  }
+
+  .grid-2 {
+    grid-template-columns: 1fr;
+  }
+
+  .create__submit {
+    margin: 0 calc(var(--sp-4) * -1) calc(var(--sp-4) * -1);
+    padding: var(--sp-3) var(--sp-4);
+    bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom));
+    border-radius: 0 0 var(--r-lg) var(--r-lg);
+  }
+
+  .create__submit .btn {
+    flex: 1;
+  }
+
+  .create__summary {
+    display: none;
+  }
+
+  .res-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .page__actions .btn {
+    flex: 1;
+  }
+
+  .stage__actions {
+    width: 100%;
+  }
+
+  .stage__actions .btn {
+    flex: 1;
+  }
+}

@@ -45,7 +45,16 @@ The frontend depends only on this contract. Interactive docs: `/api/docs` (Swagg
 Errors use `{"detail": {"code": "...", "message": "..."}}` (validation errors use FastAPI's
 standard 422 list format). Storage keys and provider job IDs are never exposed.
 
-Planned later: `GET /api/jobs/{id}/events` (Server-Sent Events) to replace polling.
+The frontend polls `GET /api/jobs/{id}` adaptively (1.5 s while progress moves, up to 6 s
+when it stalls, 15 s in a background tab, and not at all once the job finishes). Planned
+later: `GET /api/jobs/{id}/events` (Server-Sent Events) to replace polling.
+
+### Contract between backend and frontend
+
+The backend is the source of truth. `backend/scripts/export_contract.py` writes
+`backend/openapi.json` (from which `frontend/src/api/schema.d.ts` is generated) and
+`frontend/src/api/constraints.json` (allowed resolutions, frame counts, ranges and upload
+limits). `backend/tests/test_contract.py` fails if either is stale.
 
 ### Job lifecycle
 

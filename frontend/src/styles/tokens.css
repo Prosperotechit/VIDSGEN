@@ -1,0 +1,71 @@
+/* VIDSGEN design tokens. Dark, cinematic, restrained.
+   One warm accent (projector-light amber), used sparingly for primary actions and focus. */
+:root {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg: #0a0b0d;
+  --bg-elevated: #0f1013;
+  --surface: #131418;
+  --surface-2: #181a1f;
+  --surface-3: #1e2026;
+  --overlay: rgba(10, 11, 13, 0.72);
+
+  /* Lines */
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.12);
+  --line-focus: rgba(240, 180, 90, 0.55);
+
+  /* Text */
+  --text: #ecedef;
+  --text-muted: #a1a4ad;
+  --text-faint: #6c707a;
+  --text-on-accent: #17120a;
+
+  /* Accent */
+  --accent: #f0b45a;
+  --accent-hover: #f5c378;
+  --accent-soft: rgba(240, 180, 90, 0.12);
+  --accent-glow: rgba(240, 180, 90, 0.22);
+
+  /* Status */
+  --ok: #5fd39a;
+  --ok-soft: rgba(95, 211, 154, 0.12);
+  --warn: #f0b45a;
+  --warn-soft: rgba(240, 180, 90, 0.12);
+  --info: #8aa8ff;
+  --info-soft: rgba(138, 168, 255, 0.12);
+  --danger: #f27878;
+  --danger-soft: rgba(242, 120, 120, 0.12);
+  --neutral-soft: rgba(255, 255, 255, 0.06);
+
+  /* Type */
+  --font-display: "Space Grotesk Variable", "Inter Variable", system-ui, sans-serif;
+  --font-body: "Inter Variable", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.8125rem;
+  --fs-md: 0.9375rem;
+  --fs-lg: 1.125rem;
+  --fs-xl: 1.5rem;
+  --fs-2xl: 2rem;
+
+  /* Shape & space */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-xl: 20px;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+
+  --sidebar-w: 248px;
+  --tabbar-h: 64px;
+  --shadow-lg: 0 24px 60px -24px rgba(0, 0, 0, 0.7);
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}

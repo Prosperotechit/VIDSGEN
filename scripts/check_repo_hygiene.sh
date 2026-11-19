@@ -19,7 +19,7 @@ for f in "${files[@]}"; do
   if [[ "$f" =~ $forbidden_ext ]]; then
     echo "FORBIDDEN FILE TYPE: $f"; fail=1
   fi
-  if [[ "$f" =~ $forbidden_name && "$f" != ".env.example" ]]; then
+  if [[ "$f" =~ $forbidden_name && "$f" != ".env.example" && "$f" != */.env.example ]]; then
     echo "SECRET FILE: $f"; fail=1
   fi
   size=$(stat -c %s "$f")

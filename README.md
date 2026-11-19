@@ -30,8 +30,8 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 | Path | Purpose |
 |---|---|
-| `frontend/` | React + Vite + TypeScript web app (Phase 3) |
-| `backend/` | Python FastAPI API, job queue, providers, storage (Phase 2) |
+| `frontend/` | React + Vite + TypeScript web app |
+| `backend/` | Python FastAPI API, job queue, providers, storage |
 | `workflows/comfyui/` | ComfyUI workflow templates and the exact model manifest |
 | `notebooks/` | Kaggle notebook that runs ComfyUI for GPU testing (Phase 5) |
 | `scripts/` | Repo checks and model download helpers |
@@ -57,14 +57,15 @@ Wan 2.2 TI2V-5B: one 5B model for both text-to-video and image-to-video, native
 |---|---|---|
 | 1 | Repository scaffolding, docs, model manifest | ✅ |
 | 2 | Backend: jobs API, progress, provider interface, mock provider, local storage, tests | ✅ |
-| 3 | Frontend: T2V/I2V forms, progress, preview, download | ⏳ |
+| 3 | Frontend: T2V/I2V forms, progress, preview, download, history | ✅ |
 | 4 | ComfyUI provider, workflow templates, model download script | ⏳ |
 | 5 | Kaggle notebook: ComfyUI + token proxy + Cloudflare quick tunnel, T4 verification | ⏳ |
 | 6 | End-to-end T2V and I2V validation | ⏳ |
 
 ## Getting started
 
-Run the backend with the mock provider (no GPU needed): see [backend/README.md](backend/README.md).
+Run the backend with the mock provider (no GPU needed), then the web app:
+see [backend/README.md](backend/README.md) and [frontend/README.md](frontend/README.md).
 
 ```bash
 cp .env.example .env
