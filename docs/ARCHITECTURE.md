@@ -31,28 +31,36 @@
 
 ## Public API (frontend ↔ backend)
 
-The frontend depends only on this contract.
+The frontend depends only on this contract. Interactive docs: `/api/docs` (Swagger UI).
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/jobs` | Create a job. Multipart: `mode` (`t2v`/`i2v`), `prompt`, `negative_prompt?`, `image?` (I2V), `resolution`, `duration_frames`, `seed?` |
-| `GET` | `/api/jobs/{id}` | Job record: status, progress (0–100), timestamps, error, result URLs |
-| `GET` | `/api/jobs/{id}/events` | Server-Sent Events: `status`, `progress`, `completed`, `failed` |
-| `GET` | `/api/jobs/{id}/video` | Stream the result for preview (HTTP Range support for seeking) |
-| `GET` | `/api/jobs/{id}/download` | Same file with `Content-Disposition: attachment` |
-| `POST` | `/api/jobs/{id}/cancel` | Cancel a queued or running job |
-| `GET` | `/api/health` | API health plus inference-provider reachability |
+| `POST` | `/api/jobs` | Submit a job (multipart form): `mode` (`t2v`/`i2v`), `prompt`, `negative_prompt?`, `resolution`, `num_frames` (4k+1, 17–121), `fps`, `steps`, `guidance_scale`, `seed?`, `image` (required for i2v, rejected for t2v). Returns **202** immediately. |
+| `GET` | `/api/jobs` | History, newest first. `limit` (1–100), `offset`, optional `status` filter |
+| `GET` | `/api/jobs/{id}` | Status, progress (0–100), parameters, timestamps, error, result URLs |
+| `GET` | `/api/jobs/{id}/download` | The MP4 as an attachment; `?inline=true` serves it for `<video>` preview. Supports HTTP Range (seeking). |
+| `POST` | `/api/jobs/{id}/cancel` | Cancel a queued or processing job (409 if already finished) |
+| `GET` | `/api/health` | API health plus inference-provider and storage status |
+
+Errors use `{"detail": {"code": "...", "message": "..."}}` (validation errors use FastAPI's
+standard 422 list format). Storage keys and provider job IDs are never exposed.
+
+Planned later: `GET /api/jobs/{id}/events` (Server-Sent Events) to replace polling.
 
 ### Job lifecycle
 
 ```
-queued ──▶ submitting ──▶ running ──▶ saving ──▶ completed
-   │            │             │          │
-   └────────────┴─────────────┴──────────┴──▶ failed / cancelled
+queued ──▶ processing ──▶ completed
+   │            ├────────▶ failed      (provider error, timeout, crash, server restart)
+   └────────────┴────────▶ cancelled   (user request)
 ```
 
-If the provider is unreachable (e.g. the Kaggle session ended), jobs stay `queued`
-and `/api/health` reports the provider as offline, rather than failing silently.
+- Progress reaches 100 % only after the video is safely stored.
+- Every status change is a conditional database update, so a cancellation can never be
+  overwritten by a worker that is finishing at the same moment.
+- After a restart, `processing` jobs are marked `failed` (code `interrupted`) and `queued`
+  jobs are queued again.
+- If the provider is unreachable, `/api/health` reports `degraded`; jobs still queue.
 
 ## Inference provider layer (the GPU swap point)
 
@@ -64,6 +72,7 @@ class InferenceProvider(Protocol):
     def progress(self, provider_job_id: str) -> AsyncIterator[Progress]: ...
     async def fetch_result(self, provider_job_id: str) -> ResultFile: ...
     async def cancel(self, provider_job_id: str) -> None: ...
+    async def release(self, provider_job_id: str) -> None: ...   # optional cleanup hook
 ```
 
 `GenerationRequest` is provider-neutral (mode, prompt, image bytes, width, height,
@@ -96,14 +105,19 @@ no authentication, so it only listens on `127.0.0.1` behind the token proxy.
 
 ```python
 class Storage(Protocol):
-    async def put(self, key: str, data: BinaryIO, content_type: str) -> None: ...
-    async def open(self, key: str, byte_range: tuple[int, int] | None = None) -> AsyncIterator[bytes]: ...
-    async def url(self, key: str, expires_s: int = 3600) -> str | None: ...   # presigned/CDN URL if supported
+    async def put_bytes(self, key: str, data: bytes, content_type: str) -> None: ...
+    async def put_file(self, key: str, src: Path, content_type: str) -> None: ...
+    async def get_bytes(self, key: str) -> bytes: ...
+    def iter_chunks(self, key: str) -> AsyncIterator[bytes]: ...
+    async def exists(self, key: str) -> bool: ...
+    async def size(self, key: str) -> int: ...
     async def delete(self, key: str) -> None: ...
+    def local_path(self, key: str) -> Path | None: ...   # local disk only: efficient Range serving
+    async def url(self, key: str, expires_seconds: int = 3600) -> str | None: ...  # presigned/CDN URL (S3)
 ```
 
-- Keys are stable and provider-independent: `uploads/{job_id}/input.{ext}`,
-  `outputs/{job_id}/video.mp4`, `outputs/{job_id}/thumb.jpg`.
+- Keys are stable and provider-independent: `uploads/{job_id}/input.png` (normalised,
+  EXIF stripped) and `outputs/{job_id}/video.mp4`.
 - The DB stores **keys, not file paths**, so moving from `local` to `s3` (AWS S3,
   Cloudflare R2, Backblaze B2, MinIO) needs no data-model change.
 - Results are always copied off the GPU host as soon as they finish.

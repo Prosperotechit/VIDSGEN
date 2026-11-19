@@ -55,8 +55,8 @@ Wan 2.2 TI2V-5B: one 5B model for both text-to-video and image-to-video, native
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1 | Repository scaffolding, docs, model manifest | ✅ this commit |
-| 2 | Backend: jobs API, SSE progress, provider interface, mock provider, local storage | ⏳ |
+| 1 | Repository scaffolding, docs, model manifest | ✅ |
+| 2 | Backend: jobs API, progress, provider interface, mock provider, local storage, tests | ✅ |
 | 3 | Frontend: T2V/I2V forms, progress, preview, download | ⏳ |
 | 4 | ComfyUI provider, workflow templates, model download script | ⏳ |
 | 5 | Kaggle notebook: ComfyUI + token proxy + Cloudflare quick tunnel, T4 verification | ⏳ |
@@ -64,7 +64,7 @@ Wan 2.2 TI2V-5B: one 5B model for both text-to-video and image-to-video, native
 
 ## Getting started
 
-Setup instructions are added with each phase. For now:
+Run the backend with the mock provider (no GPU needed): see [backend/README.md](backend/README.md).
 
 ```bash
 cp .env.example .env
