@@ -134,7 +134,7 @@ class _Outage:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and self.fake.outage:
-            await PlainTextResponse("Service Unavailable", status_code=503)(scope, receive, send)
+            await PlainTextResponse("Service Unavailable", status_code=self.fake.outage_status)(scope, receive, send)
             return
         await self.app(scope, receive, send)
 
@@ -166,7 +166,8 @@ class FakeComfyUI:
         self.upload_mode = "ok"              # ok | error
         self.view_override: tuple[int, bytes] | None = None
         self.history_delete_mode = "ok"
-        self.outage = False                  # True: every HTTP request gets 503 (a proxy/tunnel with no upstream)
+        self.outage = False                  # True: every HTTP request gets `outage_status` (a proxy/tunnel with no upstream)
+        self.outage_status = 503
         self.view_failures = 0               # the next N downloads (/view) get 503, then work
         # observed
         self.requests: list[dict[str, Any]] = []

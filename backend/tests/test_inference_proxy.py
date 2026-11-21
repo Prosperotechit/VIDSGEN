@@ -100,9 +100,9 @@ def upstream_paths(fake) -> list[tuple[str, str]]:
 class ProxyServer:
     """The proxy as a real server on a random loopback port (for the provider/backend end-to-end tests)."""
 
-    def __init__(self, app):
+    def __init__(self, app, port=None):
         self.app = app
-        self.port = free_port()
+        self.port = port or free_port()
         self.server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=self.port, lifespan="on", timeout_graceful_shutdown=1,
                                                     **px.uvicorn_options()))
         self.thread = threading.Thread(target=self.server.run, daemon=True)

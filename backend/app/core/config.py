@@ -6,12 +6,52 @@ This is the only module that reads the environment. Everything else receives a
 
 from __future__ import annotations
 
+import ipaddress
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+MIN_REMOTE_TOKEN_CHARS = 32     # the inference proxy refuses shorter tokens too
+
+
+def is_loopback_host(host: str | None) -> bool:
+    """True for localhost and loopback addresses (127.0.0.0/8, ::1): traffic that never leaves this machine."""
+    if not host:
+        return False
+    host = host.strip("[]").rstrip(".").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def check_comfyui_endpoint(url: str, token: str) -> None:
+    """Raises ValueError (never echoing the URL or the token) unless this is a safe place to send generation traffic.
+
+    * Only plain http(s) URLs without credentials, query or fragment.
+    * A loopback address (development, or a proxy on the same machine) may use http and needs no token.
+    * ANYTHING ELSE must use https and carry a bearer token of at least 32 characters: prompts, images and videos
+      must not cross a network in clear text or unauthenticated."""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("COMFYUI_BASE_URL must be an http:// or https:// URL with a host")
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise ValueError("COMFYUI_BASE_URL must not contain credentials (use COMFYUI_API_TOKEN)")
+    if parts.query or parts.fragment:
+        raise ValueError("COMFYUI_BASE_URL must not contain a query string or fragment")
+    if not is_loopback_host(parts.hostname):
+        if parts.scheme != "https":
+            raise ValueError("COMFYUI_BASE_URL must use https:// unless it points to this machine (127.0.0.1 / localhost)")
+        if len(token) < MIN_REMOTE_TOKEN_CHARS:
+            raise ValueError(f"COMFYUI_API_TOKEN is required for a remote COMFYUI_BASE_URL and must be at least "
+                             f"{MIN_REMOTE_TOKEN_CHARS} characters")
+
 
 APP_DIR = Path(__file__).resolve().parents[1]          # backend/app
 BACKEND_DIR = APP_DIR.parent                           # backend/
@@ -22,6 +62,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(REPO_ROOT / ".env", BACKEND_DIR / ".env"),
         env_file_encoding="utf-8",
+        hide_input_in_errors=True,          # a validation error must never print a URL or token it was given
         extra="ignore",
         case_sensitive=False,
     )
@@ -94,6 +135,8 @@ class Settings(BaseSettings):
                              "(one GPU, proven only for one job at a time)")
         from ..jobs.envelope import GenerationEnvelope   # validates the mode/resolution/frame overrides
         GenerationEnvelope.from_settings(self)
+        if self.inference_provider == "comfyui" and self.comfyui_base_url:
+            check_comfyui_endpoint(self.comfyui_base_url, self.comfyui_api_token.get_secret_value())
         return self
 
     @field_validator("comfyui_base_url", mode="after")

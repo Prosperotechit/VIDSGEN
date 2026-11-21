@@ -87,7 +87,7 @@ def test_invalid_base_url_rejected():
 
 def test_broken_workflows_fail_at_startup(tmp_path):
     with pytest.raises(WorkflowError):
-        build_provider(Settings(_env_file=None, inference_provider="comfyui", comfyui_base_url="http://x:1",
+        build_provider(Settings(_env_file=None, inference_provider="comfyui", comfyui_base_url="http://127.0.0.1:1",
                                 comfyui_workflows_dir=tmp_path))
 
 

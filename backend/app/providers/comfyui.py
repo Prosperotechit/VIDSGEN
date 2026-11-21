@@ -50,6 +50,7 @@ from urllib.parse import urlsplit
 import httpx
 from websockets.asyncio.client import connect as ws_connect
 
+from ..core.config import check_comfyui_endpoint
 from ..jobs.models import GenerationMode
 from ..workflows import GraphValues, WorkflowError, WorkflowTemplates
 from .base import (
@@ -71,7 +72,7 @@ _HEALTH_TTL = 10.0          # seconds a health result is reused (the UI polls /a
 _NODE_CHECK_TTL = 600.0     # node classes rarely change: re-check every 10 minutes
 _LOST_AFTER_POLLS = 3       # consecutive polls with the prompt in neither queue nor history
 # Failures that mean "could not talk to ComfyUI right now" (a tunnel blip, a restart), as opposed to an answer.
-_TRANSIENT_CODES = frozenset({"comfyui_unreachable", "comfyui_timeout", "comfyui_server_error"})
+_TRANSIENT_CODES = frozenset({"comfyui_unreachable", "comfyui_timeout", "comfyui_server_error", "comfyui_busy"})
 _DOWNLOAD_ATTEMPTS = 3
 _DOWNLOAD_RETRY_STATUSES = frozenset({502, 503, 504})
 _GPU_OOM_MARKERS = ("out of memory", "allocation on device", "cublas_status_alloc_failed", "cudnn_status_alloc_failed")
@@ -120,6 +121,8 @@ class ComfyUIProvider(InferenceProvider):
     ):
         if not base_url:
             raise ValueError("COMFYUI_BASE_URL must be set when INFERENCE_PROVIDER=comfyui")
+        if transport is None:           # (tests inject a transport and never touch the network)
+            check_comfyui_endpoint(base_url, api_token)
         self.base_url = base_url.rstrip("/")
         self.workflows = workflows
         self.timeout = timeout
@@ -167,6 +170,10 @@ class ComfyUIProvider(InferenceProvider):
         except httpx.HTTPError as e:
             log.warning("ComfyUI %s %s failed: %s (host %s)", method, path, type(e).__name__, self._log_host)
             raise ProviderError("comfyui_unreachable", "The GPU server (ComfyUI) is unreachable.") from None
+        if resp.status_code == 429:         # the proxy (or ComfyUI) says "too many requests": nothing was started; retry shortly
+            err = ProviderError("comfyui_busy", "The GPU server is busy; try again shortly.")
+            err.not_sent = True
+            raise err
         if resp.status_code in (401, 403):
             raise ProviderError("comfyui_auth_failed", "The GPU server rejected the API token (check COMFYUI_API_TOKEN).")
         if resp.status_code >= 500:
