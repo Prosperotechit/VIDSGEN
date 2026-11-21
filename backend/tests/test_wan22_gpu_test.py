@@ -1178,3 +1178,151 @@ def test_the_installer_fails_if_the_hosts_environment_was_modified(installed, mo
     with pytest.raises(RuntimeError, match="the host's Python environment was modified by the install") as e:
         g.install_comfyui(base, url, sha, "0.46.0", python=BASE_PY)
     assert "evil-pkg was ADDED" in str(e.value) and "numpy changed" in str(e.value)
+
+
+# ====================================================================== regression: a stale NumPy record on the host (Kaggle: numpy 2.1.3 + numpy-1.26.4 metadata)
+# The installer used to pin "the first of the sorted versions" from the host's package inventory. With a stale numpy-1.26.4 record next to
+# the real numpy 2.1.3, that is "1.26.4": pip was told numpy==1.26.4 and installed a second NumPy into the venv, every time.
+def make_stale_record(directory: Path, name="numpy", version="1.26.4") -> Path:
+    dist = directory / f"{name}-{version}.dist-info"
+    dist.mkdir(parents=True)
+    (dist / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+    return directory
+
+
+def host_numpy_version() -> str | None:
+    p = subprocess.run([BASE_PY, "-c", "import numpy; print(numpy.__version__)"], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else None
+
+
+needs_host_numpy = pytest.mark.skipif(host_numpy_version() is None, reason="the host Python has no numpy")
+
+
+@needs_host_numpy
+def test_reproduction_the_inventorys_first_sorted_version_is_the_stale_record(tmp_path):
+    """The old rule: it picks 1.26.4 although the host imports the real NumPy."""
+    stale = make_stale_record(tmp_path / "stale")
+    env = {**venv_env(tmp_path), "PYTHONPATH": str(stale)}
+    inventory = g.host_inventory(BASE_PY, env, tmp_path)
+    assert "1.26.4" in inventory["numpy"] and host_numpy_version() in inventory["numpy"]
+    assert inventory["numpy"][0] == "1.26.4"                      # <- what `inventory["numpy"][0]` used to feed into constraints.txt
+
+
+@needs_host_numpy
+def test_host_pins_follow_the_imported_numpy_not_the_stale_record(tmp_path):
+    stale = make_stale_record(tmp_path / "stale")
+    env = {**venv_env(tmp_path), "PYTHONPATH": str(stale)}
+    pins, conflicts = g.host_pins(BASE_PY, env, tmp_path)
+    assert pins["numpy"] == host_numpy_version() != "1.26.4"
+    assert {v for v, _ in conflicts["numpy"]} == {"1.26.4", host_numpy_version()}               # visible, with locations
+    assert any(str(stale) in path for _, path in conflicts["numpy"])
+    # and with nothing stale there is nothing to report
+    pins2, conflicts2 = g.host_pins(BASE_PY, venv_env(tmp_path), tmp_path)
+    assert pins2 == pins and "numpy" not in conflicts2
+
+
+def probe_entry(imported, *records):
+    return {"imported": imported, "metadata": [[v, f"/site/{i}"] for i, v in enumerate(records)]}
+
+
+KAGGLE_LIKE = {
+    "torch": probe_entry(["2.11.0+cu130", "/p/torch/__init__.py"], "2.11.0+cu130"),
+    "torchvision": probe_entry(["0.26.0+cu130", "/p/torchvision/__init__.py"], "0.26.0+cu130"),
+    "torchaudio": probe_entry(["2.11.0+cu130", "/p/torchaudio/__init__.py"], "2.11.0+cu130"),
+    "numpy": probe_entry(["2.1.3", "/p/numpy/__init__.py"], "2.1.3"),
+}
+
+
+def with_entry(name, entry):
+    return {**json.loads(json.dumps(KAGGLE_LIKE)), name: entry}
+
+
+def test_select_pins_for_the_verified_kaggle_stack():
+    pins, conflicts = g.select_pins(KAGGLE_LIKE)
+    assert pins == {"torch": "2.11.0+cu130", "torchvision": "0.26.0+cu130", "torchaudio": "2.11.0+cu130", "numpy": "2.1.3"}
+    assert conflicts == {}
+
+
+@pytest.mark.parametrize("records", [("1.26.4", "2.1.3"), ("2.1.3", "1.26.4"), ("1.26.4", "2.1.3", "1.24.0"), ("2.1.3", "1.26.4", "2.1.3")])
+def test_a_stale_record_never_wins_whatever_the_order(records):
+    pins, conflicts = g.select_pins(with_entry("numpy", probe_entry(["2.1.3", "/p/numpy/__init__.py"], *records)))
+    assert pins["numpy"] == "2.1.3" and "numpy" in conflicts and len(conflicts["numpy"]) == len(records)
+
+
+def test_a_local_build_tag_the_metadata_omits_still_matches_the_imported_release():
+    """pip's metadata may say 2.15.0 while the module says 2.15.0+cu132: the pin is the metadata form pip understands."""
+    pins, _ = g.select_pins(with_entry("torch", probe_entry(["2.15.0+cu132", "/p/torch/__init__.py"], "2.15.0")))
+    assert pins["torch"] == "2.15.0"
+
+
+def test_a_pin_that_cannot_be_matched_to_the_imported_release_is_an_error_not_a_guess():
+    with pytest.raises(RuntimeError, match=r"cannot establish which numpy the host uses.*imports 2\.1\.3.*1\.26\.4"):
+        g.select_pins(with_entry("numpy", probe_entry(["2.1.3", "/p/numpy/__init__.py"], "1.26.4")))
+    with pytest.raises(RuntimeError, match="cannot establish which numpy"):
+        g.select_pins(with_entry("numpy", probe_entry(["2.1.3", "/p/numpy/__init__.py"])))                  # imported, no record at all
+
+
+def test_a_package_that_fails_to_import_on_the_host_stops_the_installer():
+    with pytest.raises(RuntimeError, match=r"numpy is installed on the host but importing it fails \(ImportError\)"):
+        g.select_pins(with_entry("numpy", {"imported": ["error", "ImportError"], "metadata": [["2.1.3", "/x"]]}))
+
+
+def test_absent_packages_are_skipped_and_installed_but_unimportable_ones_stay_protected():
+    probe = with_entry("torchaudio", {"imported": None, "metadata": []})
+    assert "torchaudio" not in g.select_pins(probe)[0]
+    probe = with_entry("torchaudio", {"imported": None, "metadata": [["2.11.0", "/x"]]})
+    assert g.select_pins(probe)[0]["torchaudio"] == "2.11.0"
+
+
+@needs_host_stack
+def test_install_pins_the_imported_numpy_even_when_the_inventory_lists_a_stale_record_first(installed, offline_upstream, monkeypatch):
+    """End to end (offline): the inventory is made to report numpy ['1.26.4', <real>] exactly as on Kaggle. The constraints file and the
+    resulting venv must still use the real NumPy, and the verification must pass (it is not weakened)."""
+    base, first, (url, sha) = installed
+    real = g.host_pins(BASE_PY, venv_env(base.parent), base)[0]["numpy"]
+    original = g.host_inventory
+
+    def with_stale_record(python, env, cwd):
+        inv = original(python, env, cwd)
+        return {**inv, "numpy": sorted({"1.26.4", *inv["numpy"]})}
+
+    monkeypatch.setattr(g, "host_inventory", with_stale_record)
+    monkeypatch.setattr(g, "EXTRA_REQUIREMENTS", ["pip"])
+    r = g.install_comfyui(base, url, sha, "0.46.0", python=BASE_PY)
+    constraints = (base / "constraints.txt").read_text().splitlines()
+    assert f"numpy=={real}" in constraints and "numpy==1.26.4" not in constraints
+    assert r["pinned_by_constraints"]["numpy"] == real and r["host_environment_unchanged"] is True
+    assert r["protected_packages"]["numpy"]["identical_to_host"] is True and r["torch_replaced"] is False
+    assert not list((base / "venv").glob("lib/python*/site-packages/numpy"))          # no second NumPy inside the venv
+
+
+@needs_host_stack
+def test_rerunning_the_installer_rewrites_the_constraints_from_the_hosts_real_packages(installed, offline_upstream, monkeypatch):
+    """The Kaggle symptom: fixing constraints.txt by hand did not stick, because every run rewrote it. Now every run rewrites it correctly."""
+    base, _, (url, sha) = installed
+    (base / "constraints.txt").write_text("numpy==1.26.4\ntorch==0.0.1\n")           # a wrong file left behind by a failed earlier run
+    monkeypatch.setattr(g, "EXTRA_REQUIREMENTS", ["pip"])
+    r = g.install_comfyui(base, url, sha, "0.46.0", python=BASE_PY)
+    text = (base / "constraints.txt").read_text()
+    assert "1.26.4" not in text and "0.0.1" not in text and r["host_environment_unchanged"] is True
+
+
+@needs_host_stack
+def test_a_failed_verification_still_names_what_was_pinned(installed, monkeypatch):
+    base, _, (url, sha) = installed
+    venv_py = str(g.venv_python(base / "venv"))
+    real_probe = g.import_probe
+
+    def probe(py, env):
+        r = real_probe(py, env)
+        if py == venv_py:
+            r["packages"]["numpy"] = ["1.26.4", str(base / "venv" / "lib" / "numpy" / "__init__.py")]     # the Kaggle symptom
+        return r
+    monkeypatch.setattr(g, "import_probe", probe)
+    monkeypatch.setattr(g, "EXTRA_REQUIREMENTS", ["pip"])
+    with pytest.raises(RuntimeError, match=r"(?s)numpy changed: .* -> 1\.26\.4.*a second numpy was installed inside the venv.*pinned from the host: .*numpy=="):
+        g.install_comfyui(base, url, offline_upstream_sha(base), "0.46.0", python=BASE_PY)
+
+
+def offline_upstream_sha(base):
+    return subprocess.run(["git", "-C", str(base / "ComfyUI"), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()

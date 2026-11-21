@@ -62,7 +62,9 @@ Wan 2.2 TI2V-5B: one 5B model for both text-to-video and image-to-video, native
 | 5A | Kaggle GPU preflight notebook | ✅ |
 | 5B | Pinned ComfyUI + verified model download + first real text-to-video smoke test: **passed on a Kaggle T4** (832×480, 17 frames; see [docs/KAGGLE_SETUP.md](docs/KAGGLE_SETUP.md)). Not yet: image-to-video, backend-to-ComfyUI inference, production use | ✅ |
 | 5C | Token proxy + Cloudflare quick tunnel, backend connection, image-to-video | ⏳ |
-| 6 | End-to-end T2V and I2V validation | ⏳ |
+| 6A | GPU generation limits (`t4_verified` profile) and clearer ComfyUI error handling (out-of-memory, connection loss) | ✅ |
+| 6B | Real backend + ComfyUI on one Kaggle T4 over localhost: **passed** (real 832×480 / 17-frame text-to-video through the FastAPI backend, every check passed; see [docs/KAGGLE_SETUP.md](docs/KAGGLE_SETUP.md)). Not yet: image-to-video, real GPU cancellation, the frontend, a tunnel/proxy, production use | ✅ |
+| 6 | End-to-end T2V and I2V validation through the frontend | ⏳ |
 
 ## Getting started
 

@@ -479,6 +479,66 @@ def inventory_changes(before: dict[str, list[str]], after: dict[str, list[str]])
     return out
 
 
+# --- Which version of each protected package must be pinned? ---------------------------------------------------------
+# A Python environment can contain SEVERAL metadata records (dist-info) for one package, e.g. a stale numpy-1.26.4.dist-info next to
+# the real numpy 2.1.3. Taking "the first of the sorted versions" picks the stale record, so the constraints file then told pip to
+# install numpy==1.26.4 into the venv (a second NumPy, replacing the host's 2.1.3 for the venv). The pin must instead come from the
+# package the host really IMPORTS, using the metadata record that describes that exact release.
+PINS_PROBE = (
+    "import importlib,importlib.metadata as m,json\n"
+    "out={}\n"
+    f"for n in {list(PINNED_PACKAGES)!r}:\n"
+    " try:\n"
+    "  mod=importlib.import_module(n);imp=[str(getattr(mod,'__version__',None)),getattr(mod,'__file__',None)]\n"
+    " except ImportError:\n"
+    "  imp=None\n"
+    " except Exception as e:\n"
+    "  imp=['error',type(e).__name__]\n"
+    " ds=[[d.version,str(getattr(d,'_path',''))] for d in m.distributions() if (d.metadata['Name'] or '').lower().replace('_','-')==n]\n"
+    " out[n]={'imported':imp,'metadata':ds}\n"
+    "print(json.dumps(out))")
+
+
+def _public(version: str) -> str:
+    """'2.11.0+cu130' -> '2.11.0' (PyTorch's module version carries a local build tag that its metadata may omit)."""
+    return str(version).split("+", 1)[0]
+
+
+def select_pins(probe: dict) -> tuple[dict[str, str], dict[str, list[list[str]]]]:
+    """(pins, conflicts) from the PINS_PROBE output.
+
+    pins: name -> the version string pip knows for the package the host actually imports. It must match the imported module's
+    release, otherwise the pin cannot be trusted and this raises (it never guesses). conflicts: packages with more than one
+    metadata record, with their locations (reported so a stale record is visible, not silently ignored)."""
+    pins: dict[str, str] = {}
+    conflicts: dict[str, list[list[str]]] = {}
+    for name in PINNED_PACKAGES:
+        entry = probe.get(name) or {}
+        imported, records = entry.get("imported"), entry.get("metadata") or []
+        if len({v for v, _ in records}) > 1:
+            conflicts[name] = records
+        if imported is None:
+            if records:                      # installed but not importable on the host: still keep pip from replacing it
+                pins[name] = records[0][0]
+            continue
+        if imported[0] == "error":
+            raise RuntimeError(f"{name} is installed on the host but importing it fails ({imported[1]}); refusing to continue")
+        matching = [v for v, _ in records if _public(v) == _public(imported[0])]
+        if not matching:
+            raise RuntimeError(f"cannot establish which {name} the host uses: it imports {imported[0]} from {imported[1]}, "
+                               f"but its installed-package records say {[v for v, _ in records] or 'nothing'}; refusing to guess a pin")
+        pins[name] = matching[0]
+    return pins, conflicts
+
+
+def host_pins(python: str, env: dict[str, str], cwd: Path) -> tuple[dict[str, str], dict[str, list[list[str]]]]:
+    """The versions to protect, taken from what the host's Python imports (see select_pins)."""
+    p = subprocess.run([python, "-c", PINS_PROBE], capture_output=True, text=True, env=env, cwd=cwd, timeout=300)
+    if p.returncode != 0:
+        raise RuntimeError(f"cannot inspect the protected packages with {python}:\n" + redact(p.stderr)[-600:])
+    return select_pins(json.loads(p.stdout.strip().splitlines()[-1]))
+
+
 def install_comfyui(base: Path, repo_url: str, commit: str, expect_version: str | None, python: str = sys.executable) -> dict:
     base.mkdir(parents=True, exist_ok=True)
     cenv = cache_env(base)
@@ -492,8 +552,8 @@ def install_comfyui(base: Path, repo_url: str, commit: str, expect_version: str 
         raise RuntimeError("ComfyUI checkout has local modifications:\n" + dirty[:300])
 
     env = clean_env(None, **cenv)
-    inventory_before = host_inventory(python, env, base)        # the host's packages, before we touch anything
-    before = {n: inventory_before[n][0] for n in PINNED_PACKAGES if n in inventory_before}
+    inventory_before = host_inventory(python, env, base)        # the host's packages, before we touch anything (change detection only)
+    before, metadata_conflicts = host_pins(python, env, base)   # what to protect: the packages the host really imports
     if "torch" not in before:
         raise RuntimeError("PyTorch is not installed on this host; refusing to install one blindly")
     constraints = base / "constraints.txt"
@@ -515,7 +575,9 @@ def install_comfyui(base: Path, repo_url: str, commit: str, expect_version: str 
     host_seen, seen = import_probe(python, env), import_probe(str(venv_python(venv)), env)
     problems = protected_packages_replaced(host_seen, seen, venv)
     if problems:
-        raise RuntimeError("the host's PyTorch/NumPy stack was replaced: " + "; ".join(problems))
+        raise RuntimeError("the host's PyTorch/NumPy stack was replaced: " + "; ".join(problems)
+                           + f" (pinned from the host: {', '.join(f'{n}=={v}' for n, v in sorted(before.items()))}"
+                           + (f"; host packages with several metadata records: {sorted(metadata_conflicts)}" if metadata_conflicts else "") + ")")
     changes = inventory_changes(inventory_before, host_inventory(python, env, base))
     if changes:
         more = f" (+{len(changes) - 12} more)" if len(changes) > 12 else ""
@@ -529,7 +591,7 @@ def install_comfyui(base: Path, repo_url: str, commit: str, expect_version: str 
             "python": seen["python"], "torch": seen["packages"]["torch"][0], "torch_file": seen["packages"]["torch"][1],
             "torch_replaced": False, "protected_packages": protected,
             "host_environment_unchanged": True, "host_packages_checked": len(inventory_before),
-            "pinned_by_constraints": before, "requirements_removed": removed, "pip_seconds": round(time.monotonic() - t0),
+            "pinned_by_constraints": before, "host_metadata_conflicts": metadata_conflicts, "requirements_removed": removed, "pip_seconds": round(time.monotonic() - t0),
             "pip_check": (chk.stdout + chk.stderr).strip()[-600:] or "No broken requirements found."}
 
 

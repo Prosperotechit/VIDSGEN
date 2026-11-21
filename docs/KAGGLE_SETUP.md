@@ -252,6 +252,70 @@ and checked for token patterns. No tunnel is started.
 **Still untested after the first GPU run:** image-to-video on a GPU, output quality beyond the automated checks, other
 sizes and frame counts, the tunnel and token proxy, and the backend driving a real ComfyUI end to end.
 
+## Phase 6A/6B: the backend with limits, then backend + ComfyUI on one Kaggle GPU (localhost only)
+
+**6A (done, on GitHub):** the backend can enforce a GPU *generation envelope* (`GENERATION_PROFILE=t4_verified`: text-to-video,
+832x480, at most 17 frames, at most 20 steps, one job at a time) and reports ComfyUI out-of-memory failures and lost connections
+clearly (`gpu_out_of_memory`, `system_out_of_memory`, `comfyui_connection_lost`; a running job survives a connection loss of up to
+`COMFYUI_CONNECTION_GRACE_SECONDS`, default 30). The limits are enforced at the API boundary (`POST /api/jobs`), not inside
+`JobManager`. Uncertain ComfyUI submissions are never retried automatically. Image-to-video stays disabled in `t4_verified` until it
+has been tested on a GPU. The API defaults (49 frames, 30 steps) are unchanged, so the test sends every value explicitly.
+
+**6B (PASSED on a Kaggle T4):** `notebooks/kaggle_backend_e2e_phase6b.ipynb` runs the real FastAPI backend and ComfyUI together on the
+Kaggle machine, both on `127.0.0.1` only. No tunnel, no proxy, nothing exposed. The Phase 5B notebook's stages are unchanged.
+
+### Result of the real run (Kaggle, GPU 0)
+
+| Item | Result |
+|---|---|
+| Notebook | all 8 stages passed; backend-to-ComfyUI end-to-end verdict **PASS** |
+| GPU / software | NVIDIA Tesla T4; ComfyUI v0.46.0; Wan 2.2 TI2V-5B; `GENERATION_PROFILE=t4_verified`, one job at a time |
+| Request (sent explicitly) | text-to-video, 832 x 480, 17 frames, 20 steps, 24 fps, CFG 5.0, through the backend's `POST /api/jobs` |
+| Output | valid H.264 MP4, 227,056 bytes; decoding, frame count, dimensions and non-blank checks passed |
+| Durations | job 97.31 s; total end-to-end 99.8 s |
+| Peak GPU memory | 14,885 MiB of 15,360 MiB (about 97%) |
+| Peak system RAM | 20.56 GiB |
+| Also verified | live progress tracking and health (`inference: ok` after the generation); download, HTTP Range request and inline preview; four out-of-envelope requests (resolution, frames, steps, image-to-video) each returned HTTP 422; backend and ComfyUI both bound to localhost only |
+
+These figures were reported from the Kaggle run; the report JSON files are not stored in the repository.
+
+**What this shows:** the existing FastAPI backend, `ComfyUIProvider` and job manager run one real Wan 2.2 text-to-video job on a T4 over
+localhost, with the generation limits enforced and the video retrieved and verified.
+
+**What it does not show (still open):** real GPU **cancellation** was not tested (`RUN_CANCEL_TEST` stays off by default); **image-to-video**
+has not been run on a GPU; no browser **frontend** has been used with a real GPU backend; the token proxy and a tunnel are not built; only this
+one small size was tested, one job at a time. **No production readiness is claimed.** Peak VRAM left about 470 MiB of headroom.
+
+**An installation problem found during this run (fixed).** On Kaggle the host has NumPy 2.1.3 plus a stale second NumPy metadata record
+(1.26.4). The installer used the first of the sorted versions, so it pinned `numpy==1.26.4` and installed a second NumPy into the venv; the
+protected-package verification (correctly) failed, and a hand-edited `constraints.txt` was overwritten on every run. The installer now pins the
+version of the package the host actually **imports** (matched to its metadata record, never guessing), reports any host package with several
+records as `host_metadata_conflicts`, and still verifies that the venv imports the host's identical torch, torchvision, torchaudio and numpy. The fix
+is in `scripts/wan22_gpu_test.py` and both regenerated notebooks, with regression tests. Kaggle's system packages are never modified.
+
+### How to run it on Kaggle
+1. Download `notebooks/kaggle_backend_e2e_phase6b.ipynb` and import it (*File -> Import Notebook*). The repository is public: no GitHub
+   credential is needed. (If it ever becomes private, add the token as a Kaggle Secret; never put it in a cell.)
+2. *Settings -> Accelerator:* **GPU T4 x2**; *Internet:* **On**. Optional secret `HF_TOKEN` (not needed for these public models).
+3. **Run All.** A new session starts empty, so the notebook installs the pinned ComfyUI and downloads the three model files (16.9 GiB, size
+   and SHA-256 verified) again. Expect roughly 15-30 minutes in total; the first generation also loads the models.
+4. Read the verdict printed by stage 7. It lists each check as PASS/FAIL. `BACKEND END-TO-END VERDICT: PASS` appears only if **all** pass.
+5. Send back `/kaggle/working/vidsgen_phase6b_report.json` and `/kaggle/working/vidsgen_phase6b_e2e_report.json` (no secrets), and the
+   `STOP`/`[FAIL]` lines if a stage stopped the run.
+6. Optional: set `RUN_CANCEL_TEST = True` in the second code cell to also cancel a second job during processing (extra GPU time).
+
+### What stage 7 checks (every one must pass)
+Backend and ComfyUI listen on loopback only; `provider` is `comfyui` and ready; four out-of-envelope requests (1280x704, 49 frames, 30 steps,
+image-to-video) are rejected with 422 and create no job; one real job (832x480, 17 frames, 20 steps, 24 fps, CFG 5.0) is accepted, its
+status moves queued -> processing -> completed with live, non-decreasing progress including intermediate values; the job record matches the
+request; the video downloads (attachment), supports an HTTP Range request and an inline preview; the MP4 fully decodes as H.264 with 17
+frames at 832x480 and 24 fps and is not blank; `/api/health` reports `inference: ok` afterwards; the backend stops cleanly.
+
+### What the PASS shows and does not show
+It shows: the existing backend, `ComfyUIProvider` and job manager can run one real Wan 2.2 text-to-video job on a T4 over localhost.
+It does **not** show: real GPU cancellation, image-to-video on a GPU, a browser/frontend in front of the backend, the token proxy or a tunnel,
+other sizes or frame counts, repeated or concurrent jobs, or any production readiness.
+
 **Troubleshooting**
 
 | Symptom | Likely cause / action |
@@ -260,6 +324,9 @@ sizes and frame counts, the tunnel and token proxy, and the backend driving a re
 | `[FAIL] torch_supports_gpu` | Kaggle's PyTorch lacks `sm_75`: needs a matching PyTorch (a decision, not automatic) |
 | `[FAIL] python` | Kaggle Python < 3.11: the backend code needs 3.11+ |
 | `could not create the virtual environment` / `ensurepip` | the venv must be created with `--without-pip` (the installer does this); an older venv that lacks `--system-site-packages` is refused, not modified: delete `/kaggle/tmp/vidsgen-gpu/venv` and re-run |
+| `STOP at stage 'backend_install'` | the backend's dependencies could not be installed in the ComfyUI venv, or they would have replaced Kaggle's PyTorch/NumPy (the message says which); nothing was changed on the host |
+| `backend_e2e` verdict FAIL | each failed check is named with its reason; `gpu_out_of_memory` means the GPU ran out of memory even at the verified size (report it, do not raise the limits) |
+| `numpy changed: 2.1.3 -> 1.26.4` / `a second numpy was installed inside the venv` | the host has a stale second NumPy metadata record; fixed: the installer now pins the version the host actually **imports** (and lists any host package with several records under `host_metadata_conflicts`). If it still fails, delete `/kaggle/tmp/vidsgen-gpu/venv` and `constraints.txt` and re-run; never edit Kaggle's system packages |
 | `pip install failed` | PyTorch was protected by the constraints; the message names the conflicting requirement |
 | download `exit code 3` | network drop: re-run the cell; it resumes |
 | download `exit code 4` | a file failed size/SHA-256 and was **deleted**: do not retry blindly; report it |
