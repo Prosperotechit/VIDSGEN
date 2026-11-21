@@ -95,17 +95,19 @@ cluttered background, three legs, many people in the background, walking backwar
 
 ## Required models
 
-| File | ComfyUI folder | Size |
-|---|---|---|
-| `wan2.2_ti2v_5B_fp16.safetensors` | `models/diffusion_models/` | 10.0 GB |
-| `wan2.2_vae.safetensors` | `models/vae/` | 1.4 GB |
-| `umt5_xxl_fp8_e4m3fn_scaled.safetensors` | `models/text_encoders/` | 6.7 GB |
+| File | ComfyUI folder | Size | Source (pinned) |
+|---|---|---|---|
+| `wan2.2_ti2v_5B_fp16.safetensors` | `models/diffusion_models/` | 9,999,658,848 B | `Comfy-Org/Wan-2.2` @ `5df3a4a3ed06` |
+| `wan2.2_vae.safetensors` | `models/vae/` | 1,409,400,960 B | `Comfy-Org/Wan-2.2` @ `5df3a4a3ed06` |
+| `umt5_xxl_fp8_e4m3fn_scaled.safetensors` | `models/text_encoders/` | 6,735,906,897 B | `Comfy-Org/Wan-2.1` @ `d6258323e18f` |
 
-`scripts/download_models.py --comfyui-dir <ComfyUI>` shows exactly what it would download and where. It is a dry
-run unless `--execute` is given. `/api/health` reports "degraded" if ComfyUI lacks any file or if a file's size
-differs from the exact size above (e.g. a 0-byte placeholder or an interrupted download). File contents cannot be
-hashed through ComfyUI's API, so weight integrity and inference readiness are reported as **unverified** until a
-real generation succeeds (see `docs/PROVIDERS.md`).
+Total 18,144,966,705 bytes (16.9 GiB). `models.yaml` also records each file's SHA-256 (the Git-LFS object id, confirmed by two
+independent Hugging Face metadata sources; the Xet hash is a different identifier and is not used) and its pinned
+revision. `scripts/download_models.py --comfyui-dir <ComfyUI data dir>` is a dry run unless `--execute` is given; with it,
+every file is verified by exact size **and** SHA-256, and a mismatch deletes the file and stops. `--verify-only` re-checks
+files already on disk. `/api/health` reports "degraded" if ComfyUI lacks any file or a file's size differs (a 0-byte
+placeholder, an interrupted download); file contents cannot be hashed through ComfyUI's API, so weight integrity and
+inference readiness stay **unverified** until a real generation succeeds (see `docs/PROVIDERS.md`).
 
 ## What has been validated, and how
 
@@ -114,4 +116,5 @@ real generation succeeds (see `docs/PROVIDERS.md`).
 | Schema | Both templates, and graphs built for **every** VIDSGEN-allowed value, against `/object_info` of ComfyUI 0.46.0 (`backend/tests/test_workflows.py`) | ✅ offline tests |
 | Real server validation | Both templates accepted by a real ComfyUI 0.46.0 `POST /prompt` (CPU, placeholder weights) | ✅ done in Phase 4 |
 | Real output path | `CreateVideo`→`SaveVideo` with these exact settings on real ComfyUI → MP4, H.264 High, yuv420p, 24 fps | ✅ done in Phase 4 |
-| **Actual Wan generation** | Model loading, sampling, quality, VRAM/time on a T4 | ❌ **Phase 5 (GPU)**. Not tested yet. |
+| **Actual Wan generation (text-to-video)** | Model loading, sampling and decoding, 832×480 × 17 frames on a Kaggle T4: valid H.264 MP4, 105.4 s, peak 14,885 MiB VRAM | ✅ Phase 5B smoke test passed (see `docs/KAGGLE_SETUP.md`) |
+| Image-to-video on a GPU; quality; larger sizes; backend-to-ComfyUI end to end | | ❌ Not tested yet |

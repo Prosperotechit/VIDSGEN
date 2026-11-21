@@ -1,38 +1,59 @@
 # Exact model components for Wan 2.2 TI2V-5B in ComfyUI.
-# Verified on Hugging Face (file paths and byte sizes) on 2026-11-19.
-# Used by scripts/download_models.py (Phase 4) and the Kaggle notebook.
+# Used by scripts/download_models.py and the Kaggle notebook (notebooks/kaggle_comfyui_wan22.ipynb).
 # Weights are downloaded at runtime and are NEVER committed.
 #
 # License: Wan 2.2 is Apache-2.0 (Wan-AI/Wan2.2-TI2V-5B model card).
-
+#
+# --- How the integrity fields were established (2026-11-20) -----------------------------------
+# Each repository's `revision` is the commit that `main` pointed to when this was recorded
+# (GET https://huggingface.co/api/models/<repo>/revision/main -> sha). Downloads are pinned to it,
+# so a later change to `main` can never alter what is downloaded.
+#
+# `sha256` is the SHA-256 of the FILE CONTENT. For these Git-LFS files Hugging Face stores it as the
+# LFS object id, and it was read from two independent sources that agreed exactly:
+#   1. GET https://huggingface.co/api/models/<repo>/paths-info/<revision>   -> lfs.oid
+#   2. HEAD https://huggingface.co/<repo>/resolve/<revision>/<path> (redirects off) -> x-linked-etag
+# `size_bytes` agreed across: this manifest, paths-info lfs.size and the x-linked-size header.
+#
+# Other identifiers Hugging Face returns for the same files are NOT SHA-256 and are not used:
+#   * xetHash / x-xet-hash : the Xet storage chunk-tree hash, a different algorithm.
+#   * oid (non-LFS)        : the Git blob id of the ~135-byte LFS pointer file, not of the weights.
+#
+# The downloader refuses to download any file whose `revision` or `sha256` is missing or malformed,
+# and deletes any file whose size or SHA-256 does not match.
 model: wan2.2-ti2v-5b
 native_output:
   resolutions: ["1280x704", "704x1280"]   # TI2V-5B's 720p sizes
   fps: 24
   frame_rule: "4k+1"                      # e.g. 49, 73, 97, 121 (121 ~= 5 s)
-
 files:
   - role: diffusion_model
-    repo: Comfy-Org/Wan_2.2_ComfyUI_Repackaged
+    repo: Comfy-Org/Wan-2.2
+    revision: 5df3a4a3ed0628002308022198249dbbbd045d09
     path: split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors
     comfyui_dir: models/diffusion_models
     size_bytes: 9999658848          # ~10.0 GB (no official fp8 build of the 5B exists)
+    sha256: 456f901338bd9eadbded3828b819109a9b68e8a525ca5cf8d0049a69fcfeca1e
 
   - role: vae
-    repo: Comfy-Org/Wan_2.2_ComfyUI_Repackaged
+    repo: Comfy-Org/Wan-2.2
+    revision: 5df3a4a3ed0628002308022198249dbbbd045d09
     path: split_files/vae/wan2.2_vae.safetensors
     comfyui_dir: models/vae
     size_bytes: 1409400960          # ~1.4 GB. MUST be the Wan 2.2 VAE; the 2.1 VAE is incompatible.
+    sha256: e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156
 
   - role: text_encoder
-    repo: Comfy-Org/Wan_2.1_ComfyUI_repackaged
+    repo: Comfy-Org/Wan-2.1
+    revision: d6258323e18f14c60d37899da97ca555f3118259
     path: split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors
     comfyui_dir: models/text_encoders
     size_bytes: 6735906897          # ~6.7 GB. fp8 chosen over fp16 (11.4 GB) to fit Kaggle RAM/VRAM.
+    sha256: c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68
 
+total_bytes: 18144966705            # 16.9 GiB; the three sizes above sum to exactly this
 total_download_gb: 18.1
-
-# Explicitly NOT compatible with this pipeline (do not mix in):
+# Explicitly NOT compatible with this pipeline (do not mix in; the downloader refuses these paths):
 incompatible:
   - "Wan 2.2 14B T2V/I2V high_noise / low_noise models (different architecture, far more VRAM)"
   - "wan2.2_fun_* 5B/14B variants (different conditioning inputs)"
