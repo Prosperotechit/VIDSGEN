@@ -697,3 +697,63 @@ def test_a_missing_output_is_not_retried(comfy, fake):
     job = wait_for(c, submit(c).json()["id"])
     assert job["error"]["code"] == "output_download_failed" and "404" in job["error"]["message"]
     assert len([r for r in fake.requests if r["path"] == "/view"]) == 1
+
+
+# ====================================================================== Phase 6C Stage 2: read-only reconciliation of uncertain submissions
+def posts_to(fake, path="/prompt"):
+    return [r for r in fake.requests if r["path"] == path and r["method"] == "POST"]
+
+
+@pytest.mark.parametrize("mode", ["queue_then_hang", "queue_then_500"])
+def test_a_lost_submission_response_is_reconciled_without_resubmitting(comfy, fake, mode):
+    """ComfyUI queued the prompt but the response was lost: the job must continue, and the prompt must be sent exactly once."""
+    fake.prompt_mode = mode
+    c = comfy(comfyui_timeout=0.5)
+    job = wait_for(c, submit(c).json()["id"], timeout=40)
+    assert job["status"] == "completed", job["error"]
+    assert len(posts_to(fake)) == 1                                                     # never resubmitted
+
+
+def test_reconciliation_uses_only_read_only_requests(comfy, fake):
+    fake.prompt_mode = "queue_then_hang"
+    c = comfy(comfyui_timeout=0.5)
+    job_id = submit(c).json()["id"]
+    wait_for(c, job_id, timeout=40)
+    first_post = next(i for i, r in enumerate(fake.requests) if r["path"] == "/prompt")
+    between = [r for r in fake.requests[first_post + 1:] if r["path"].startswith("/history/") or r["path"] == "/queue"]
+    assert between and between[0]["method"] == "GET"                                    # the first thing after the lost response is a read
+    assert [r["method"] for r in fake.requests if r["path"] in ("/prompt",)] == ["POST"]
+
+
+def test_a_prompt_that_comfyui_does_not_know_is_reported_failed_and_not_resubmitted(comfy, fake):
+    fake.prompt_mode = "hang"                                                           # never queued
+    c = comfy(comfyui_timeout=0.5)
+    job = wait_for(c, submit(c).json()["id"], timeout=40)
+    assert job["status"] == "failed" and job["error"] == {"code": "comfyui_timeout", "message": "The GPU server (ComfyUI) did not respond in time."}
+    assert len(posts_to(fake)) == 1 and len(fake.prompts) == 0
+
+
+def test_an_unreachable_server_is_not_reconciled_it_fails_fast(make_client):
+    port = free_port()
+    c = make_client(inference_provider="comfyui", comfyui_base_url=f"http://127.0.0.1:{port}", comfyui_timeout=2)   # default 30 s grace
+    t0 = time.monotonic()
+    job = wait_for(c, submit(c).json()["id"], timeout=20)
+    assert job["error"]["code"] == "comfyui_unreachable" and time.monotonic() - t0 < 8     # a refused connection cannot have queued anything
+
+
+def test_zero_grace_disables_reconciliation(comfy, fake):
+    fake.prompt_mode = "queue_then_hang"
+    c = comfy(comfyui_timeout=0.5, comfyui_connection_grace_seconds=0)
+    job = wait_for(c, submit(c).json()["id"], timeout=40)
+    assert job["status"] == "failed" and job["error"]["code"] == "comfyui_timeout"
+    assert len(posts_to(fake)) == 1
+    first_post = next(i for i, r in enumerate(fake.requests) if r["path"] == "/prompt")
+    assert [r for r in fake.requests[first_post + 1:] if r["path"].startswith("/history/") and r["method"] == "GET"] == []   # no lookups at all
+
+
+def test_rejections_by_comfyui_are_not_reconciled(comfy, fake):
+    fake.prompt_mode = "reject_model"
+    c = comfy()
+    job = wait_for(c, submit(c).json()["id"])
+    assert job["error"]["code"] == "model_missing"
+    assert [r for r in fake.requests if r["path"] == "/queue"] == []                    # no reconciliation lookups for a definite answer

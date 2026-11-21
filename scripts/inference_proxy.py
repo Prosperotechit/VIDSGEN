@@ -16,8 +16,12 @@ What it enforces
   * Responses are rebuilt, not relayed: allow-listed headers only, queue entries reduced to ids, /history stripped of the
     submitted graph, absolute file paths scrubbed from every text that can reach a client.
 
-Not in Stage 1 (later stages): the /ws WebSocket relay (the provider falls back to polling without it), prompt_id
-idempotency, the optional dead-man switch, and the tunnel.
+Stage 2 adds: an authenticated one-way WebSocket relay for progress events (allow-listed event types only, rebuilt and
+path-scrubbed, only for prompts this proxy forwarded), streamed MP4 downloads with deterministic cleanup, bounded and
+concurrency-safe prompt_id idempotency (a reused id with a different payload is refused, a duplicate is never forwarded twice),
+read-only reconciliation of uncertain submissions (it never resubmits), and an optional dead-man switch (OFF by default).
+
+Still not here: the tunnel (a later, separately approved stage).
 
     PROXY_API_TOKEN=<>=32 random chars>  python inference_proxy.py --upstream http://127.0.0.1:8188 --port 8189 \
         --workflows-dir <repo>/workflows/comfyui
@@ -39,7 +43,7 @@ import re
 import sys
 import time
 import unicodedata
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,7 +55,8 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
+from websockets.asyncio.client import connect as ws_connect
 
 log = logging.getLogger("vidsgen.proxy")
 
@@ -91,6 +96,17 @@ class Policy:
     read_timeout: float = 30.0
     view_read_timeout: float = 120.0
     view_total_timeout: float = 600.0
+    idempotency_max_entries: int = 512
+    idempotency_ttl: float = 6 * 3600.0
+    max_ws: int = 2                     # one backend process uses one; a spare for a reconnect overlap
+    ws_frame_limit: int = 64 * 1024     # larger upstream text frames are dropped
+    ws_inbound_limit: int = 1024        # clients send nothing useful; anything bigger closes the socket
+    ws_send_timeout: float = 10.0       # a client that cannot take a frame in this time is disconnected (no unbounded buffering)
+    ws_open_timeout: float = 5.0
+    ws_max_seconds: float = 8 * 3600.0
+    dead_man_seconds: float = 0.0       # 0 = disabled (the default). When enabled, at least dead_man_min.
+    dead_man_min: float = 120.0
+    dead_man_interval: float = 15.0
 
 
 class Rejected(Exception):
@@ -142,6 +158,169 @@ def sanitize_history(body: Any, prompt_id: str) -> dict:
     status = entry.get("status") if isinstance(entry.get("status"), dict) else {}
     return {prompt_id: {"outputs": entry.get("outputs") if isinstance(entry.get("outputs"), dict) else {},
                         "status": scrub_json({k: status[k] for k in ("status_str", "completed", "messages") if k in status})}}
+
+
+WS_FIELDS = {
+    "execution_start": ("prompt_id", "timestamp"),
+    "executing": ("prompt_id", "node", "display_node"),
+    "progress": ("prompt_id", "node", "display_node", "value", "max"),
+    "execution_success": ("prompt_id", "timestamp"),
+    "execution_error": ("prompt_id", "node_id", "node_type", "executed", "exception_message", "exception_type", "traceback"),
+    "execution_interrupted": ("prompt_id", "node_id", "node_type", "executed"),
+}                                           # exactly the events ComfyUIProvider uses; everything else is dropped
+
+
+def sanitize_ws_event(raw: str, is_tracked) -> str | None:
+    """Rebuild one ComfyUI event for the client, or None to drop it. Only allow-listed event types, only the fields the provider
+    reads, only for prompts this proxy forwarded, with file paths scrubbed and sizes bounded. Never a pass-through."""
+    try:
+        msg = json.loads(raw)
+    except ValueError:
+        return None
+    kind = msg.get("type") if isinstance(msg, dict) else None
+    data = msg.get("data") if isinstance(msg, dict) else None
+    if kind not in WS_FIELDS or not isinstance(data, dict):
+        return None
+    pid = data.get("prompt_id")
+    if not isinstance(pid, str) or not UUID_RE.match(pid) or not is_tracked(pid):
+        return None
+    out = {k: data[k] for k in WS_FIELDS[kind] if k in data}
+    if isinstance(out.get("traceback"), list):
+        out["traceback"] = [str(t)[:2000] for t in out["traceback"][:50]]
+    if isinstance(out.get("exception_message"), str):
+        out["exception_message"] = out["exception_message"][:2000]
+    return json.dumps({"type": kind, "data": scrub_json(out)})
+
+
+# ===================================================================================== prompt_id registry (idempotency)
+class _Entry:
+    __slots__ = ("digest", "client_id", "state", "status", "body", "future", "created", "finished")
+
+    def __init__(self, digest, client_id, created, future):
+        self.digest, self.client_id, self.created, self.future = digest, client_id, created, future
+        self.state, self.status, self.body, self.finished = "pending", None, None, False
+
+
+def payload_digest(body: dict) -> str:
+    """Identity of a submission: the validated graph plus the client id, canonicalised."""
+    return hashlib.sha256(json.dumps({"prompt": body["prompt"], "client_id": body["client_id"]}, sort_keys=True,
+                                     separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+class PromptRegistry:
+    """Remembers every prompt_id the proxy has seen, to make submissions idempotent.
+
+    States: pending (being forwarded now), accepted (ComfyUI confirmed), uncertain (the forward failed in a way that does not
+    show whether ComfyUI queued it), cancelled (a tombstone: the id was deleted or interrupted). It is bounded (max entries,
+    TTL) and only ever evicts entries that are not pending. All methods are synchronous (no await), so on asyncio's single thread
+    each call is atomic: concurrent duplicates cannot both become 'new'."""
+
+    def __init__(self, max_entries: int, ttl: float, clock=time.monotonic):
+        self.max, self.ttl, self.clock = max_entries, ttl, clock
+        self.entries: OrderedDict[str, _Entry] = OrderedDict()
+
+    def _purge(self) -> None:
+        now = self.clock()
+        for pid in [k for k, e in self.entries.items() if e.state != "pending" and now - e.created > self.ttl]:
+            del self.entries[pid]
+
+    def _make_room(self) -> bool:
+        if len(self.entries) < self.max:
+            return True
+        for pid, e in self.entries.items():
+            if e.state != "pending":
+                del self.entries[pid]
+                return True
+        return False
+
+    def begin(self, pid: str, digest: str, client_id: str):
+        """-> (kind, entry). kind: new | pending | accepted | uncertain | cancelled | conflict | full."""
+        self._purge()
+        e = self.entries.get(pid)
+        if e is None:
+            if not self._make_room():
+                return "full", None
+            try:
+                future = asyncio.get_running_loop().create_future()
+            except RuntimeError:                                  # called outside the event loop (tests): nobody can be waiting
+                future = None
+            e = _Entry(digest, client_id, self.clock(), future)
+            self.entries[pid] = e
+            return "new", e
+        if e.state == "cancelled":
+            return "cancelled", e
+        if e.digest != digest:
+            return "conflict", e
+        return e.state, e
+
+    def _settle(self, e: _Entry, status: int, body: Any) -> None:
+        e.status, e.body = status, body
+        if e.future is not None and not e.future.done():
+            e.future.set_result((status, body))
+
+    def resolve(self, pid: str, status: int, body: Any) -> None:
+        e = self.entries.get(pid)
+        if e is not None:
+            e.state = "cancelled" if e.state == "cancelled" else "accepted"
+            self._settle(e, status, body)
+
+    def reject(self, pid: str, status: int, body: Any) -> None:
+        """ComfyUI refused it (nothing was queued): forget the id so a corrected request can use it."""
+        e = self.entries.pop(pid, None)
+        if e is not None:
+            self._settle(e, status, body)
+
+    def uncertain(self, pid: str, status: int, body: Any) -> None:
+        e = self.entries.get(pid)
+        if e is not None:
+            e.state = "cancelled" if e.state == "cancelled" else "uncertain"
+            self._settle(e, status, body)
+
+    def cancel(self, pid: str) -> None:
+        """Tombstone: a cancelled id can never be submitted again through this proxy."""
+        e = self.entries.get(pid)
+        if e is None:
+            if not self._make_room():
+                return
+            e = self.entries[pid] = _Entry(None, None, self.clock(), None)
+        e.state = "cancelled"
+
+    def is_tracked(self, pid: str) -> bool:
+        e = self.entries.get(pid)
+        return e is not None and e.state in ("pending", "accepted", "uncertain")
+
+    def active_ids(self) -> list[str]:
+        """Prompts this proxy forwarded and has not seen finish (candidates for the optional dead-man switch)."""
+        return [k for k, e in self.entries.items() if e.state in ("accepted", "uncertain") and not e.finished]
+
+    def finish(self, pid: str) -> None:
+        if pid in self.entries:
+            self.entries[pid].finished = True
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """A StreamingResponse that ALWAYS closes its generator and runs `on_close`, also when the client disconnects mid-stream
+    (where Starlette only cancels the task): upstream connections and concurrency slots are released deterministically."""
+
+    def __init__(self, *args, on_close=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.on_close = on_close
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                await self.body_iterator.aclose()
+            finally:
+                if self.on_close is not None:
+                    self.on_close()
+
+
+def uvicorn_options() -> dict:
+    """Server settings shared by the CLI and the tests: small inbound WebSocket frames, no Server/Date headers, bounded headers."""
+    return dict(log_level="warning", access_log=False, server_header=False, date_header=False, timeout_keep_alive=5,
+                limit_concurrency=64, h11_max_incomplete_event_size=16 * 1024, ws_max_size=4096, ws_ping_interval=20, ws_ping_timeout=20)
 
 
 # ===================================================================================== graph validation
@@ -281,18 +460,24 @@ def _json_response(body: Any, status: int = 200) -> JSONResponse:
 
 
 def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Policy | None = None,
-               transport: httpx.AsyncBaseTransport | None = None) -> Starlette:
+               transport: httpx.AsyncBaseTransport | None = None, clock=time.monotonic) -> Starlette:
     if len(token) < MIN_TOKEN_CHARS:
         raise ValueError(f"the proxy token must be at least {MIN_TOKEN_CHARS} characters")
     parts = urlsplit(upstream_url)
     if parts.scheme != "http" or (parts.hostname or "") not in ("127.0.0.1", "localhost", "::1") or not parts.port:
         raise ValueError("the upstream must be a loopback ComfyUI URL like http://127.0.0.1:8188")
+    host_port = f"{parts.hostname if parts.hostname != '::1' else '[::1]'}:{parts.port}"
+    logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)        # its INFO lines carry full upstream URLs: keep them out of the logs
     policy = policy or Policy()
+    if policy.dead_man_seconds and policy.dead_man_seconds < policy.dead_man_min:
+        raise ValueError(f"the dead-man switch needs at least {policy.dead_man_min:g} s of inactivity (or 0 to keep it disabled)")
     validator = GraphValidator(Path(workflows_dir), policy)
     digest = hashlib.sha256(token.encode()).digest()
     throttle = AuthThrottle(policy.auth_failures_per_minute)
-    state = {"inflight": 0, "heavy": 0, "client": None}
+    registry = PromptRegistry(policy.idempotency_max_entries, policy.idempotency_ttl, clock)
+    state = {"inflight": 0, "heavy": 0, "client": None, "last_activity": clock(), "ws": set(), "ws_tasks": set(), "reaper": None,
+             "stats": {"ws_events": 0, "ws_dropped": 0}}
 
     def client() -> httpx.AsyncClient:
         return state["client"]
@@ -386,21 +571,97 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
             raise Rejected("not found", 404)
         return _json_response(scrub_json(body)) if status == 200 and isinstance(body, list) else _json_response({"error": "upstream_error"}, 502)
 
+    def _reply(status: int, body: Any, *, replay: str | None = None) -> JSONResponse:
+        resp = JSONResponse(body, status_code=status)
+        if replay:
+            resp.headers["X-Idempotent-Replay"] = replay
+        return resp
+
+    def _refusal(status: int, reason: str) -> JSONResponse:
+        """A refusal shaped like ComfyUI's own, so ComfyUIProvider shows the reason."""
+        return _reply(status, {"error": {"type": "proxy_rejected", "message": reason, "details": "", "extra_info": {}}, "node_errors": {}})
+
+    async def reconcile(pid: str) -> tuple[bool | None, int]:
+        """READ-ONLY: is this prompt known to ComfyUI? (found, queue number). True = it is queued/running/finished; False = nowhere
+        right now (this does NOT prove it never will be: a late arrival is possible); None = ComfyUI could not be asked."""
+        try:
+            for _ in range(2):                              # history, queue, history: a prompt moving between them is not missed
+                s_h, hist = await upstream_json("GET", f"/history/{pid}")
+                if s_h == 200 and isinstance(hist, dict) and pid in hist:
+                    return True, 0
+                s_q, queue = await upstream_json("GET", "/queue")
+                if s_q == 200 and isinstance(queue, dict):
+                    for key in ("queue_running", "queue_pending"):
+                        for item in queue.get(key, []):
+                            if isinstance(item, list) and len(item) > 1 and item[1] == pid:
+                                return True, item[0] if isinstance(item[0], (int, float)) else 0
+                if not (s_h == 200 and s_q == 200):
+                    return None, 0
+            return False, 0
+        except Rejected:
+            return None, 0
+
     async def h_prompt(request, route, match):
         body = parse_json_object(await read_body(request, policy.max_prompt_body))
         only_keys(body, {"prompt", "client_id", "prompt_id"}, {"prompt", "client_id", "prompt_id"})
-        if not isinstance(body["prompt_id"], str) or not UUID_RE.match(body["prompt_id"]):
+        pid = body["prompt_id"]
+        if not isinstance(pid, str) or not UUID_RE.match(pid):
             raise Rejected("prompt_id must be a canonical lowercase UUID")
         if not isinstance(body["client_id"], str) or not CLIENT_ID_RE.match(body["client_id"]):
             raise Rejected("client_id has an invalid format")
         validator.validate(body["prompt"])
-        status, up = await upstream_json("POST", "/prompt", {"prompt": body["prompt"], "client_id": body["client_id"],
-                                                             "prompt_id": body["prompt_id"]})
+        kind, entry = registry.begin(pid, payload_digest(body), body["client_id"])
+
+        if kind == "full":
+            return _reply(429, {"error": "busy"})
+        if kind == "conflict":
+            return _refusal(409, "this prompt_id was already used with a different request")
+        if kind == "cancelled":
+            return _refusal(409, "this prompt_id was cancelled and cannot be submitted again")
+        if kind == "accepted":                               # a duplicate: answer again, never forward it a second time
+            return _reply(entry.status, entry.body, replay="1")
+        if kind == "pending":                                # the same request is being forwarded right now: share its outcome
+            try:
+                status, out = await asyncio.wait_for(asyncio.shield(entry.future), policy.read_timeout + policy.connect_timeout + 5)
+            except TimeoutError:
+                raise Rejected("the GPU server did not respond in time", 504) from None
+            return _reply(status, out, replay="1")
+        if kind == "uncertain":
+            # The first attempt's outcome is unknown. Look (read-only); NEVER resubmit.
+            found, number = await reconcile(pid)
+            if found:
+                out = {"prompt_id": pid, "number": number, "node_errors": {}}
+                registry.resolve(pid, 200, out)
+                return _reply(200, out, replay="reconciled")
+            return _refusal(409, "the outcome of the earlier submission is unknown and it was not resubmitted; "
+                                 "check the job's status, or use a new prompt_id")
+
+        # kind == "new": this call forwards it (duplicates and replays above never take a GPU-work slot)
+        if state["heavy"] >= policy.max_heavy:
+            registry.reject(pid, 429, {"error": "busy"})         # nothing was sent: forget the id
+            return JSONResponse({"error": "busy"}, status_code=429, headers={"Retry-After": "2"})
+        forwarded = {"prompt": body["prompt"], "client_id": body["client_id"], "prompt_id": pid}
+        state["heavy"] += 1
+        try:
+            status, up = await upstream_json("POST", "/prompt", forwarded)
+        except Rejected as e:                                # timeout / unreachable: ComfyUI may or may not have queued it
+            registry.uncertain(pid, e.status, {"error": "rejected", "reason": e.reason})
+            raise
+        except BaseException:                                # e.g. the client disconnected mid-forward
+            registry.uncertain(pid, 502, {"error": "upstream_error"})
+            raise
+        finally:
+            state["heavy"] -= 1
         if status == 200 and isinstance(up, dict):
-            return _json_response({k: scrub_json(up[k]) for k in ("prompt_id", "number", "node_errors") if k in up})
-        if status == 400 and isinstance(up, dict):                              # ComfyUI's own validation message, scrubbed
-            return _json_response({k: scrub_json(up[k]) for k in ("error", "node_errors") if k in up}, 400)
-        return _json_response({"error": "upstream_error"}, 502)
+            out = {k: scrub_json(up[k]) for k in ("prompt_id", "number", "node_errors") if k in up}
+            registry.resolve(pid, 200, out)
+            return _reply(200, out)
+        if status == 400 and isinstance(up, dict):           # ComfyUI's own validation message: nothing was queued
+            out = {k: scrub_json(up[k]) for k in ("error", "node_errors") if k in up}
+            registry.reject(pid, 400, out)
+            return _reply(400, out)
+        registry.uncertain(pid, 502, {"error": "upstream_error"})
+        return _reply(502, {"error": "upstream_error"})
 
     async def h_queue_get(request, route, match):
         status, body = await upstream_json("GET", "/queue")
@@ -411,6 +672,9 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
         body = parse_json_object(await read_body(request, policy.max_small_body))
         only_keys(body, {"delete"}, {"delete"})
         ids = uuid_list(body["delete"], policy)
+        if route.name == "queue":                            # a deleted prompt can never be submitted again through this proxy
+            for pid in ids:
+                registry.cancel(pid)
         status, _ = await upstream_json("POST", f"/{route.name}", {"delete": ids})
         return Response(status_code=200) if status == 200 else _json_response({"error": "upstream_error"}, 502)
 
@@ -420,6 +684,7 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
         only_keys(body, {"prompt_id"}, {"prompt_id"})
         if not isinstance(body["prompt_id"], str) or not UUID_RE.match(body["prompt_id"]):
             raise Rejected("prompt_id must be a canonical lowercase UUID")
+        registry.cancel(body["prompt_id"])
         status, _ = await upstream_json("POST", "/interrupt", {"prompt_id": body["prompt_id"]})
         return Response(status_code=200) if status == 200 else _json_response({"error": "upstream_error"}, 502)
 
@@ -458,13 +723,13 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
 
         async def body():
             try:
-                async for chunk in up.aiter_bytes(1024 * 1024):
+                async for chunk in up.aiter_bytes(1024 * 1024):      # one chunk at a time: the video is never held in memory
                     if time.monotonic() > deadline:
-                        break                                                    # bounded: the client sees a short body
+                        raise RuntimeError("download time limit")      # abort the response: a short body must not look complete
                     yield chunk
             finally:
                 await up.aclose()
-        return StreamingResponse(body(), status_code=up.status_code, headers=out_headers)
+        return ClosingStreamingResponse(body(), status_code=up.status_code, headers=out_headers)
 
     # ------------------------------------------------------------------ routing table: THE allowlist
     ROUTES = [
@@ -500,7 +765,9 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
         slot, heavy = False, False
         try:
             now = time.monotonic()
-            if not authorized(request):
+            if authorized(request):
+                state["last_activity"] = clock()
+            else:
                 throttle.record_failure(now)
                 status = 429 if throttle.blocked(now) else 401
                 return JSONResponse({"error": "unauthorized" if status == 401 else "too_many_attempts"}, status_code=status,
@@ -515,7 +782,7 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
                 name, status = "unrouted", 404
                 return deny(404, "not_found")
             name = route.name
-            heavy = route.handler in ("prompt", "view")
+            heavy = route.handler == "view"                       # (POST /prompt takes a heavy slot only when it really forwards)
             if state["inflight"] >= policy.max_concurrent or (heavy and state["heavy"] >= policy.max_heavy):
                 status = 429
                 return JSONResponse({"error": "busy"}, status_code=429, headers={**HEADERS, "Retry-After": "2"})
@@ -523,17 +790,15 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
             state["heavy"] += heavy
             slot = True
             resp = await HANDLERS[route.handler](request, route, match)
-            if isinstance(resp, StreamingResponse):                       # the slot is held until the body has been sent
-                inner = resp.body_iterator
+            if isinstance(resp, ClosingStreamingResponse):               # the slot is held until the body is sent or the client leaves
+                released = []
 
-                async def held():
-                    try:
-                        async for chunk in inner:
-                            yield chunk
-                    finally:
+                def release_slot():
+                    if not released:
+                        released.append(1)
                         state["inflight"] -= 1
                         state["heavy"] -= heavy
-                resp.body_iterator = held()
+                resp.on_close = release_slot
                 slot = False
             resp.headers.update(HEADERS)
             status = resp.status_code
@@ -554,24 +819,154 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
             log.info("%s %s -> %d %.0fms", request.method, name, status, (time.monotonic() - started) * 1000)
 
     async def ws_reject(ws: WebSocket):
-        await ws.close(code=1008)          # Stage 1: no WebSocket relay yet (rejected before the handshake completes)
+        await ws.close(code=1008)          # any WebSocket path other than /ws
+
+    def _ws_authorized(ws: WebSocket) -> bool:
+        return authorized(ws)             # same bearer check on the handshake (never a token in the URL)
+
+    async def ws_relay(ws: WebSocket):
+        """One-way, authenticated relay of ComfyUI progress events to the backend. Rejected (before the handshake completes) unless:
+        Bearer token valid, no Origin header, exactly ?clientId=<valid id>, room for another socket, and ComfyUI accepted the
+        upstream connection. Client frames are never forwarded; events are rebuilt (see sanitize_ws_event)."""
+        if not _ws_authorized(ws):
+            throttle.record_failure(time.monotonic())
+            await ws.close(code=1008)
+            return
+        state["last_activity"] = clock()
+        pairs = parse_qsl(ws.url.query, keep_blank_values=True)
+        if "origin" in ws.headers or len(pairs) != 1 or pairs[0][0] != "clientId" or not CLIENT_ID_RE.match(pairs[0][1]):
+            await ws.close(code=1008)
+            return
+        cid = pairs[0][1]
+        if len(state["ws"]) >= policy.max_ws or cid in state["ws"]:
+            await ws.close(code=1013)
+            return
+        state["ws"].add(cid)                                  # reserved before any await: no race between two handshakes
+        upstream = None
+        tasks: list[asyncio.Task] = []
+        try:
+            try:
+                upstream = await ws_connect(f"ws://{host_port}/ws?clientId={cid}", open_timeout=policy.ws_open_timeout,
+                                            max_size=4 * 1024 * 1024, ping_interval=20, ping_timeout=20, proxy=None)
+            except Exception:                                 # ComfyUI down/refusing: the handshake is refused, the provider polls
+                await ws.close(code=1013)
+                return
+            await ws.accept()
+
+            async def pump():
+                async for raw in upstream:
+                    if isinstance(raw, (bytes, bytearray)) or len(raw) > policy.ws_frame_limit:
+                        state["stats"]["ws_dropped"] += 1
+                        continue                              # binary previews and oversized frames are dropped
+                    out = sanitize_ws_event(raw, registry.is_tracked)
+                    if out is None:
+                        state["stats"]["ws_dropped"] += 1
+                        continue
+                    await asyncio.wait_for(ws.send_text(out), policy.ws_send_timeout)       # a stalled client is cut off, not buffered
+                    state["stats"]["ws_events"] += 1
+
+            async def watch():
+                frames = 0
+                while True:
+                    msg = await ws.receive()
+                    if msg["type"] == "websocket.disconnect":
+                        return
+                    frames += 1
+                    if frames > 20 or len(msg.get("text") or msg.get("bytes") or b"") > policy.ws_inbound_limit:
+                        return                                # clients have nothing to say: flooding closes the socket
+
+            tasks = [asyncio.create_task(pump()), asyncio.create_task(watch())]
+            state["ws_tasks"].update(tasks)
+            await asyncio.wait(tasks, timeout=policy.ws_max_seconds, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            state["ws_tasks"].difference_update(tasks)
+            state["ws"].discard(cid)
+            state["last_activity"] = clock()
+            if upstream is not None:
+                await upstream.close()
+            if ws.client_state == WebSocketState.CONNECTED:
+                try:
+                    # A stalled client never drains its socket, so even a close frame can block: bound it, then let uvicorn drop the connection.
+                    await asyncio.wait_for(ws.close(code=1000), 2.0)
+                except (RuntimeError, WebSocketDisconnect, TimeoutError):
+                    pass
+
+    # ------------------------------------------------------------------ optional dead-man switch (disabled unless configured)
+    async def reap_once() -> int:
+        """Cancel prompts THIS proxy forwarded that are still queued/running. Targeted only (never a global interrupt or clear)."""
+        ids = registry.active_ids()
+        if not ids:
+            return 0
+        try:
+            status, queue = await upstream_json("GET", "/queue")
+            if status != 200 or not isinstance(queue, dict):
+                return 0
+            running = {i[1] for i in queue.get("queue_running", []) if isinstance(i, list) and len(i) > 1}
+            pending = {i[1] for i in queue.get("queue_pending", []) if isinstance(i, list) and len(i) > 1}
+            reaped = 0
+            for pid in ids:
+                if pid in pending:
+                    registry.cancel(pid)
+                    await upstream_json("POST", "/queue", {"delete": [pid]})
+                    reaped += 1
+                elif pid in running:
+                    registry.cancel(pid)
+                    await upstream_json("POST", "/interrupt", {"prompt_id": pid})
+                    reaped += 1
+                else:
+                    registry.finish(pid)                      # finished or unknown to ComfyUI: nothing to stop, stop tracking it
+            if reaped:
+                log.warning("dead-man switch: cancelled %d orphaned prompt(s) after %.0fs without backend activity", reaped,
+                            policy.dead_man_seconds)
+            return reaped
+        except Rejected:
+            return 0
+
+    async def dead_man_tick() -> int:
+        """Acts only when the backend has been completely silent: no authenticated request AND no open WebSocket for the whole
+        period. A live backend always generates activity (its progress loop polls at least every ~10 s and keeps its WebSocket
+        open), so a legitimately long GPU job is never interrupted merely for taking long."""
+        if not policy.dead_man_seconds or state["ws"]:
+            return 0
+        if clock() - state["last_activity"] < policy.dead_man_seconds:
+            return 0
+        return await reap_once()
+
+    async def dead_man_loop():
+        while True:
+            await asyncio.sleep(policy.dead_man_interval)
+            try:
+                await dead_man_tick()
+            except Exception:
+                log.exception("dead-man check failed")
 
     @asynccontextmanager
     async def lifespan(app):
         state["client"] = httpx.AsyncClient(
-            base_url=f"http://{parts.hostname if parts.hostname != '::1' else '[::1]'}:{parts.port}", follow_redirects=False,
+            base_url=f"http://{host_port}", follow_redirects=False,
             timeout=httpx.Timeout(policy.connect_timeout, read=policy.read_timeout, write=policy.read_timeout, pool=policy.connect_timeout),
             transport=transport, trust_env=False)
+        if policy.dead_man_seconds:
+            state["reaper"] = asyncio.create_task(dead_man_loop())
         try:
             yield
         finally:
+            if state["reaper"] is not None:
+                state["reaper"].cancel()
+                await asyncio.gather(state["reaper"], return_exceptions=True)
+            for t in list(state["ws_tasks"]):                  # tear every relay down; each handler closes its sockets
+                t.cancel()
             await state["client"].aclose()
 
     methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
     app = Starlette(routes=[Route("/{path:path}", dispatch, methods=methods), Route("/", dispatch, methods=methods),
-                            WebSocketRoute("/{path:path}", ws_reject)],
+                            WebSocketRoute("/ws", ws_relay), WebSocketRoute("/{path:path}", ws_reject)],
                     lifespan=lifespan)
-    app.state.policy, app.state.validator = policy, validator
+    app.state.policy, app.state.validator, app.state.registry = policy, validator, registry
+    app.state.state, app.state.reap_once, app.state.dead_man_tick = state, reap_once, dead_man_tick
     return app
 
 
@@ -582,21 +977,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8189)
     ap.add_argument("--workflows-dir", required=True)
+    ap.add_argument("--dead-man-seconds", type=float, default=0.0,
+                    help="OFF by default (0). If set (minimum 120): cancel prompts this proxy forwarded when the backend has been "
+                         "completely silent (no request and no open WebSocket) for this long")
     a = ap.parse_args(argv)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         print("FAILED: the proxy listens on loopback only in this stage (making it reachable is a separate, approved step).", file=sys.stderr)
         return 2
     token = os.environ.get(TOKEN_ENV, "")
     try:
-        app = create_app(a.upstream, token, Path(a.workflows_dir))
+        app = create_app(a.upstream, token, Path(a.workflows_dir), Policy(dead_man_seconds=a.dead_man_seconds))
     except (ValueError, OSError, KeyError) as e:
         print(f"FAILED: {e if TOKEN_ENV not in str(e) else 'invalid configuration'}", file=sys.stderr)
         return 2
     import uvicorn
 
     logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    uvicorn.run(app, host=a.host, port=a.port, log_level="warning", access_log=False, server_header=False, date_header=False,
-                timeout_keep_alive=5, limit_concurrency=64, h11_max_incomplete_event_size=16 * 1024)
+    uvicorn.run(app, host=a.host, port=a.port, **uvicorn_options())
     return 0
 
 

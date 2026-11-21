@@ -153,6 +153,14 @@ class ComfyUIProvider(InferenceProvider):
     async def _request(self, method: str, path: str, *, timeout: float | None = None, **kw) -> httpx.Response:
         try:
             resp = await self._http.request(method, path, timeout=timeout or self.timeout, **kw)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            # No connection was ever made, so the request certainly did not arrive (submit() must not reconcile these).
+            log.warning("ComfyUI %s %s could not connect: %s (host %s)", method, path, type(e).__name__, self._log_host)
+            err = ProviderError("comfyui_timeout" if isinstance(e, httpx.ConnectTimeout) else "comfyui_unreachable",
+                                "The GPU server (ComfyUI) did not respond in time." if isinstance(e, httpx.ConnectTimeout)
+                                else "The GPU server (ComfyUI) is unreachable.")
+            err.not_sent = True
+            raise err from None
         except httpx.TimeoutException:
             log.warning("ComfyUI %s %s timed out (host %s)", method, path, self._log_host)
             raise ProviderError("comfyui_timeout", "The GPU server (ComfyUI) did not respond in time.") from None
@@ -289,14 +297,22 @@ class ComfyUIProvider(InferenceProvider):
         except TimeoutError:
             pass  # progress() falls back to polling
         try:
-            resp = await self._request("POST", "/prompt", json={
-                "prompt": graph, "client_id": self.client_id, "prompt_id": prompt_id,
-            })
-            body = self._json(resp, "queue prompt")
-            if resp.status_code != 200 or (isinstance(body, dict) and body.get("node_errors")):
-                raise self._rejection(body)
-            if not isinstance(body, dict) or not body.get("prompt_id"):
-                raise ProviderError("comfyui_bad_response", "The GPU server did not return a prompt id.")
+            try:
+                resp = await self._request("POST", "/prompt", json={
+                    "prompt": graph, "client_id": self.client_id, "prompt_id": prompt_id,
+                })
+                body = self._json(resp, "queue prompt")
+                if resp.status_code != 200 or (isinstance(body, dict) and body.get("node_errors")):
+                    raise self._rejection(body)
+                if not isinstance(body, dict) or not body.get("prompt_id"):
+                    raise ProviderError("comfyui_bad_response", "The GPU server did not return a prompt id.")
+            except ProviderError as e:
+                # The outcome is UNCERTAIN when the connection failed or timed out (or ComfyUI answered 5xx): the prompt may
+                # have been queued. Look, read-only. Never resubmit: a second POST could run the same generation twice.
+                if e.code not in _TRANSIENT_CODES or getattr(e, "not_sent", False) or not await self._reconcile_submission(prompt_id):
+                    raise
+                log.info("Prompt %s was queued although its submission response was lost (found by read-only reconciliation)", prompt_id)
+                body = {"prompt_id": prompt_id}
         except BaseException:
             self._runs.pop(prompt_id, None)
             raise
@@ -307,6 +323,31 @@ class ComfyUIProvider(InferenceProvider):
             self._runs[returned] = run
         log.info("Job %s queued on ComfyUI as prompt %s (mode=%s)", request.job_id, run.prompt_id, request.mode.value)
         return run.prompt_id
+
+    async def _reconcile_submission(self, prompt_id: str) -> bool:
+        """READ-ONLY check (GET /history/<id>, GET /queue) after an uncertain submission: True if ComfyUI knows the prompt.
+
+        Retries only while ComfyUI cannot be reached, for at most COMFYUI_CONNECTION_GRACE_SECONDS (0 disables reconciliation).
+        False means "not found right now" (a very late arrival is still conceivable) or "could not be asked": the submission is
+        then reported as failed, never retried."""
+        if self.connection_grace <= 0:
+            return False
+        deadline = time.monotonic() + self.connection_grace
+        while True:
+            try:
+                history = await self._get_json(f"/history/{prompt_id}", "history")
+                if isinstance(history, dict) and prompt_id in history:
+                    return True
+                queue = await self._get_json("/queue", "queue")
+                if isinstance(queue, dict):
+                    for key in ("queue_running", "queue_pending"):
+                        if any(isinstance(i, list) and len(i) > 1 and str(i[1]) == prompt_id for i in queue.get(key, [])):
+                            return True
+                return False                                    # ComfyUI answered both questions: it does not know the prompt
+            except ProviderError as e:
+                if e.code not in _TRANSIENT_CODES or time.monotonic() >= deadline:
+                    return False
+                await asyncio.sleep(self.poll_interval)
 
     # ================================================================== progress
     def _get_run(self, prompt_id: str) -> _Run:

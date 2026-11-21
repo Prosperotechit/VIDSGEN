@@ -162,7 +162,7 @@ class FakeComfyUI:
         self.foreign_events = False          # inject events for unknown prompt ids
         self.ignore_client_prompt_id = False
         self.validate_prompts = True         # False: accept graphs that aren't the Wan workflow
-        self.prompt_mode = "ok"              # ok | reject_model | reject_image | server_error | malformed | hang | no_id
+        self.prompt_mode = "ok"              # ok | reject_model | reject_image | server_error | malformed | hang | no_id | queue_then_hang | queue_then_500
         self.upload_mode = "ok"              # ok | error
         self.view_override: tuple[int, bytes] | None = None
         self.history_delete_mode = "ok"
@@ -176,6 +176,7 @@ class FakeComfyUI:
         self.interrupts: list[Any] = []
         self.deleted: list[str] = []
         self.ws_auth_headers: list[str | None] = []
+        self.ws_received: list[Any] = []     # frames clients sent to /ws
         # internals
         self._pending: list[str] = []
         self._running: str | None = None
@@ -237,6 +238,16 @@ class FakeComfyUI:
         self.paused = False
         if self._loop:
             self._loop.call_soon_threadsafe(self._wake.set)
+
+    def inject(self, client_id: str, payload: str | bytes) -> None:
+        """Send a raw frame (text or binary) to every socket of `client_id`, as ComfyUI would."""
+        async def go():
+            for ws in list(self._sockets.get(client_id, [])):
+                try:
+                    await (ws.send_bytes(payload) if isinstance(payload, bytes) else ws.send_text(payload))
+                except Exception:
+                    pass
+        asyncio.run_coroutine_threadsafe(go(), self._loop).result(5)
 
     def drop_websockets(self) -> None:
         if self._loop:
@@ -353,6 +364,10 @@ class FakeComfyUI:
                              "number": self._number}
         self._pending.append(pid)
         self._wake.set()
+        if mode == "queue_then_hang":        # the prompt IS queued, but the response never arrives (a lost response)
+            await asyncio.sleep(3600)
+        if mode == "queue_then_500":
+            return PlainTextResponse("Internal Server Error", status_code=500)
         return JSONResponse({"prompt_id": pid, "number": self._number, "node_errors": {}})
 
     async def get_queue(self, request: Request):
@@ -420,7 +435,7 @@ class FakeComfyUI:
         await websocket.send_text(json.dumps({"type": "status", "data": {"status": {"exec_info": {"queue_remaining": len(self._pending)}}, "sid": cid}}))
         try:
             while True:
-                await websocket.receive_text()
+                self.ws_received.append(await websocket.receive_text())
         except (WebSocketDisconnect, Exception):
             pass
         finally:

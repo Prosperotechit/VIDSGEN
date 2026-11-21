@@ -56,8 +56,9 @@ def graph(**over) -> dict:
     return TEMPLATES.build(GenerationMode.t2v, GraphValues(**v))
 
 
-def prompt_body(g=None, **over) -> dict:
-    body = {"prompt": g if g is not None else graph(), "client_id": CLIENT, "prompt_id": PID}
+def prompt_body(g=None, pid=None, **over) -> dict:
+    """A valid submission. Each call gets a fresh prompt_id (the proxy is idempotent per id) unless one is given."""
+    body = {"prompt": g if g is not None else graph(), "client_id": CLIENT, "prompt_id": pid or str(uuid.uuid4())}
     body.update(over)
     return body
 
@@ -100,9 +101,10 @@ class ProxyServer:
     """The proxy as a real server on a random loopback port (for the provider/backend end-to-end tests)."""
 
     def __init__(self, app):
+        self.app = app
         self.port = free_port()
-        self.server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="warning", server_header=False,
-                                                    date_header=False, lifespan="on", timeout_graceful_shutdown=1))
+        self.server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=self.port, lifespan="on", timeout_graceful_shutdown=1,
+                                                    **px.uvicorn_options()))
         self.thread = threading.Thread(target=self.server.run, daemon=True)
 
     def __enter__(self):
@@ -112,6 +114,7 @@ class ProxyServer:
             assert time.monotonic() < deadline, "proxy did not start"
             time.sleep(0.01)
         self.url = f"http://127.0.0.1:{self.port}"
+        self.ws = f"ws://127.0.0.1:{self.port}"
         return self
 
     def __exit__(self, *a):
@@ -258,17 +261,9 @@ def test_everything_else_is_404_and_never_reaches_comfyui(client, fake, method, 
     assert r.content in (b'{"error":"not_found"}', b"")
 
 
-def test_websockets_are_not_relayed_in_this_stage(client, fake):
-    for headers in ({}, AUTH):
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect("/ws?clientId=x", headers=headers):
-                pass
-    assert fake.requests == []
-
-
 # ====================================================================== POST /prompt: strict workflow validation
 def test_the_workflow_the_backend_really_sends_is_accepted_and_forwarded_minimally(client, fake):
-    body = prompt_body()
+    body = prompt_body(pid=PID)
     r = client.post("/prompt", json=body, headers=AUTH)
     assert r.status_code == 200 and set(r.json()) == {"prompt_id", "number", "node_errors"} and r.json()["prompt_id"] == PID
     sent = [p for p in fake.requests if p["path"] == "/prompt"]
