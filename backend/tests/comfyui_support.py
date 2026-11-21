@@ -126,6 +126,19 @@ MODELS = {
 }
 
 
+class _Outage:
+    """ASGI wrapper: while `fake.outage` is set, plain HTTP requests are answered 503 (WebSockets are untouched)."""
+
+    def __init__(self, app, fake):
+        self.app, self.fake = app, fake
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and self.fake.outage:
+            await PlainTextResponse("Service Unavailable", status_code=503)(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 class FakeComfyUI:
     """Imitates a ComfyUI server. Runs prompts one at a time, like ComfyUI.
 
@@ -153,6 +166,8 @@ class FakeComfyUI:
         self.upload_mode = "ok"              # ok | error
         self.view_override: tuple[int, bytes] | None = None
         self.history_delete_mode = "ok"
+        self.outage = False                  # True: every HTTP request gets 503 (a proxy/tunnel with no upstream)
+        self.view_failures = 0               # the next N downloads (/view) get 503, then work
         # observed
         self.requests: list[dict[str, Any]] = []
         self.prompts: dict[str, dict[str, Any]] = {}
@@ -190,7 +205,7 @@ class FakeComfyUI:
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> FakeComfyUI:
-        config = uvicorn.Config(self.app, host="127.0.0.1", port=0, log_level="warning", ws="websockets-sansio", lifespan="on",
+        config = uvicorn.Config(_Outage(self.app, self), host="127.0.0.1", port=0, log_level="warning", ws="websockets-sansio", lifespan="on",
                                 timeout_graceful_shutdown=1)
         self._server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self._server.run, daemon=True)
@@ -342,6 +357,8 @@ class FakeComfyUI:
 
     async def get_queue(self, request: Request):
         self._log(request)
+        if not self._authorized(request.headers):
+            return PlainTextResponse("Unauthorized", status_code=401)
         item = lambda pid: [self.prompts[pid]["number"], pid, {}, {"client_id": self.prompts[pid]["client_id"]}, ["58"]]
         return JSONResponse({"queue_running": [item(self._running)] if self._running else [],
                              "queue_pending": [item(p) for p in self._pending]})
@@ -366,6 +383,8 @@ class FakeComfyUI:
 
     async def get_history(self, request: Request):
         self._log(request)
+        if not self._authorized(request.headers):
+            return PlainTextResponse("Unauthorized", status_code=401)
         pid = request.path_params["pid"]
         return JSONResponse({pid: self.history[pid]} if pid in self.history else {})
 
@@ -380,6 +399,9 @@ class FakeComfyUI:
         self._log(request)
         if not self._authorized(request.headers):
             return PlainTextResponse("Unauthorized", status_code=401)
+        if self.view_failures > 0:
+            self.view_failures -= 1
+            return PlainTextResponse("Service Unavailable", status_code=503)
         if self.view_override:
             return Response(self.view_override[1], status_code=self.view_override[0], media_type="application/octet-stream")
         q = request.query_params
@@ -424,7 +446,7 @@ class FakeComfyUI:
     async def _execute(self, pid: str) -> None:
         p = self.prompts[pid]
         cid, graph, scenario = p["client_id"], p["graph"], p["scenario"]
-        silent = scenario in ("silent_success",)
+        silent = scenario in ("silent_success", "silent_oom")
         msgs: list[list[Any]] = []
 
         async def emit(kind: str, data: dict[str, Any], record: bool = False):
@@ -447,11 +469,14 @@ class FakeComfyUI:
         for node in ("37", "38", "39", "48"):
             await emit("executing", {"node": node, "display_node": node})
             await asyncio.sleep(self.step_delay)
-        if scenario in ("error", "oom"):
+        if scenario in ("error", "oom", "oom_ram", "silent_oom"):
+            message, etype = {
+                "oom": ("CUDA out of memory. Tried to allocate 2.00 GiB", "torch.OutOfMemoryError"),
+                "silent_oom": ("CUDA out of memory. Tried to allocate 2.00 GiB", "torch.OutOfMemoryError"),
+                "oom_ram": ("[enforce fail at alloc_cpu.cpp] DefaultCPUAllocator: can't allocate memory", "RuntimeError"),
+            }.get(scenario, ("Error while deserializing header: header too small", "safetensors._safetensors_rust.SafetensorError"))
             err = {"node_id": "39", "node_type": "VAELoader", "executed": ["37", "38"],
-                   "exception_message": "CUDA out of memory. Tried to allocate 2.00 GiB" if scenario == "oom"
-                   else "Error while deserializing header: header too small",
-                   "exception_type": "torch.OutOfMemoryError" if scenario == "oom" else "safetensors._safetensors_rust.SafetensorError",
+                   "exception_message": message, "exception_type": etype,
                    "traceback": ["  File \"/srv/ComfyUI/execution.py\", line 1, in x\n"], "current_inputs": {}, "current_outputs": {}}
             await emit("execution_error", err, record=True)
             self.history[pid] = {"prompt": [], "outputs": {}, "status": {"status_str": "error", "completed": False, "messages": msgs}, "meta": {}}

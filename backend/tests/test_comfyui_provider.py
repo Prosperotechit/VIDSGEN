@@ -537,3 +537,163 @@ def test_non_wan_graph_success_does_not_verify_inference(fake):
     state, health = asyncio.run(scenario())
     assert state == "completed"
     assert {c.name: c.status for c in health.checks}["inference"] == "unverified"
+
+
+# ====================================================================== Phase 6A: out-of-memory mapping
+GPU_OOM = ("failed", "gpu_out_of_memory", "The GPU ran out of memory. Try a smaller resolution or fewer frames.")
+RAM_OOM = ("failed", "system_out_of_memory",
+           "The GPU server ran out of system memory (RAM). Try a smaller resolution or fewer frames.")
+
+
+@pytest.mark.parametrize("etype,message,trace,expected", [
+    ("torch.OutOfMemoryError", "CUDA out of memory. Tried to allocate 2.00 GiB", [], GPU_OOM),
+    ("torch.cuda.OutOfMemoryError", "", [], GPU_OOM),                                   # type alone is enough
+    ("RuntimeError", "CUDA error: out of memory", [], GPU_OOM),
+    ("RuntimeError", "Allocation on device", [], GPU_OOM),                              # comfy.model_management
+    ("RuntimeError", "CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate", [], GPU_OOM),
+    ("RuntimeError", "boom", ["File x.py\n", "torch.OutOfMemoryError: CUDA out of memory.\n"], GPU_OOM),  # only in the traceback
+    ("MemoryError", "", [], RAM_OOM),
+    ("builtins.MemoryError", "x", [], RAM_OOM),
+    ("RuntimeError", "[enforce fail at alloc_cpu.cpp:117] DefaultCPUAllocator: can't allocate memory", [], RAM_OOM),
+    ("RuntimeError", "std::bad_alloc", [], RAM_OOM),
+])
+def test_execution_errors_that_are_out_of_memory_are_recognised(etype, message, trace, expected):
+    p = ComfyUIProvider._execution_error({"exception_type": etype, "exception_message": message, "traceback": trace,
+                                          "node_type": "KSampler"})
+    assert (p.state, p.error_code, p.message) == expected
+
+
+@pytest.mark.parametrize("etype,message", [
+    ("safetensors.SafetensorError", "header too small"),
+    ("ValueError", "bedroom memory is not a thing, nor is a hall of mirrors"),          # "room"/"memory" are not markers
+    ("RuntimeError", "Expected all tensors to be on the same device"),
+    ("KeyError", "'latent'"),
+])
+def test_other_execution_errors_are_not_reported_as_out_of_memory(etype, message):
+    p = ComfyUIProvider._execution_error({"exception_type": etype, "exception_message": message, "node_type": "KSampler"})
+    assert p.error_code == "comfyui_execution_error" and p.message.startswith("ComfyUI error in KSampler")
+
+
+def test_system_memory_exhaustion_reaches_the_job(comfy, fake):
+    fake.default_scenario = "oom_ram"
+    c = comfy()
+    job = wait_for(c, submit(c).json()["id"])
+    assert job["status"] == "failed" and job["error"] == {"code": "system_out_of_memory", "message": RAM_OOM[2]}
+
+
+def test_oom_is_recognised_when_only_the_history_has_it(comfy, fake):
+    """No WebSocket events (e.g. the socket dropped): the failure is found by polling /history."""
+    fake.default_scenario = "silent_oom"
+    c = comfy()
+    job = wait_for(c, submit(c).json()["id"])
+    assert job["status"] == "failed" and job["error"] == {"code": "gpu_out_of_memory", "message": GPU_OOM[2]}
+
+
+def test_a_job_after_an_oom_still_works(comfy, fake):
+    fake.next_scenarios = ["oom"]
+    c = comfy()
+    assert wait_for(c, submit(c).json()["id"])["error"]["code"] == "gpu_out_of_memory"
+    assert wait_for(c, submit(c).json()["id"])["status"] == "completed"
+
+
+# ====================================================================== Phase 6A: connection interruptions
+def start_running(c, fake):
+    """Submit a job that ComfyUI holds in its queue (so it stays 'processing'), and wait until it is queued there."""
+    fake.paused = True
+    job_id = submit(c).json()["id"]
+    wait_for(c, job_id, statuses={"processing"})
+    deadline = time.monotonic() + 5
+    while not fake._pending and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert fake._pending
+    return job_id
+
+
+def test_a_short_outage_does_not_fail_the_job(comfy, fake):
+    c = comfy(comfyui_connection_grace_seconds=10)
+    job_id = start_running(c, fake)
+    fake.outage = True
+    time.sleep(1.0)                                      # several failed polls
+    assert c.get(f"/api/jobs/{job_id}").json()["status"] == "processing"
+    fake.outage = False
+    fake.resume()
+    job = wait_for(c, job_id)
+    assert job["status"] == "completed" and job["error"] is None
+
+
+def test_a_long_outage_fails_with_a_clear_connection_lost_error(comfy, fake):
+    c = comfy(comfyui_connection_grace_seconds=1)
+    job_id = start_running(c, fake)
+    fake.outage = True
+    job = wait_for(c, job_id)
+    assert job["status"] == "failed" and job["error"]["code"] == "comfyui_connection_lost"
+    assert "lost for more than 1 s" in job["error"]["message"] and "Please try again" in job["error"]["message"]
+    assert str(fake.port) not in str(job)                # the address is never shown to users
+
+
+def test_a_dead_server_fails_as_connection_lost_not_a_hang(comfy, fake):
+    c = comfy(comfyui_connection_grace_seconds=1)
+    job_id = start_running(c, fake)
+    fake.stop()                                          # connection refused from now on
+    job = wait_for(c, job_id)
+    assert job["status"] == "failed" and job["error"]["code"] == "comfyui_connection_lost"
+
+
+def test_zero_grace_keeps_the_old_fail_fast_behaviour(comfy, fake):
+    c = comfy(comfyui_connection_grace_seconds=0)
+    job_id = start_running(c, fake)
+    fake.outage = True
+    assert wait_for(c, job_id)["error"]["code"] == "comfyui_server_error"
+
+
+def test_only_connection_problems_are_retried(comfy, fake):
+    """A rejected token during generation is an answer, not a blip: it fails at once, not after the grace period."""
+    c = comfy(comfyui_connection_grace_seconds=600)
+    job_id = start_running(c, fake)
+    fake.token = "a-different-token"
+    fake.drop_websockets()                               # no live events: the provider polls, and is refused
+    t0 = time.monotonic()
+    job = wait_for(c, job_id, timeout=15)
+    assert job["error"]["code"] == "comfyui_auth_failed" and time.monotonic() - t0 < 10
+
+
+def test_the_overall_job_timeout_still_applies_during_an_outage(comfy, fake):
+    c = comfy(comfyui_connection_grace_seconds=600, inference_timeout_seconds=2)
+    job_id = start_running(c, fake)
+    fake.outage = True
+    assert wait_for(c, job_id, timeout=15)["error"]["code"] == "timeout"
+
+
+def test_cancelling_during_an_outage_ends_the_job(comfy, fake):
+    c = comfy(comfyui_connection_grace_seconds=600)
+    job_id = start_running(c, fake)
+    fake.outage = True
+    time.sleep(0.5)
+    assert c.post(f"/api/jobs/{job_id}/cancel").json()["status"] == "cancelled"
+    assert wait_for(c, job_id)["status"] == "cancelled"
+
+
+def test_a_failed_download_is_retried_so_a_blip_does_not_lose_the_video(comfy, fake):
+    fake.view_failures = 1                               # the first /view gets a 503 (e.g. a proxy hiccup)
+    c = comfy()
+    job = wait_for(c, submit(c).json()["id"])
+    assert job["status"] == "completed" and job["result"] is not None
+    assert len([r for r in fake.requests if r["path"] == "/view"]) == 2
+
+
+def test_a_download_that_keeps_failing_gives_up_with_a_clear_error(comfy, fake):
+    fake.view_failures = 99
+    c = comfy()
+    job = wait_for(c, submit(c).json()["id"])
+    assert job["status"] == "failed"
+    assert job["error"] == {"code": "output_download_failed", "message": "Downloading the video failed (HTTP 503)."}
+    assert len([r for r in fake.requests if r["path"] == "/view"]) == 3     # bounded
+    assert job["result"] is None
+
+
+def test_a_missing_output_is_not_retried(comfy, fake):
+    fake.view_override = (404, b"nope")
+    c = comfy()
+    job = wait_for(c, submit(c).json()["id"])
+    assert job["error"]["code"] == "output_download_failed" and "404" in job["error"]["message"]
+    assert len([r for r in fake.requests if r["path"] == "/view"]) == 1

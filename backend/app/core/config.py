@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_DIR = Path(__file__).resolve().parents[1]          # backend/app
@@ -49,6 +49,18 @@ class Settings(BaseSettings):
     comfyui_client_id: str = ""                      # empty = "vidsgen-<random>" per backend process
     comfyui_poll_interval: float = Field(2.0, gt=0, le=60)  # status polling when WebSocket events are unavailable
     comfyui_workflows_dir: Path = REPO_ROOT / "workflows" / "comfyui"
+    # How long a job survives a lost connection to ComfyUI (tunnel blip, restart) while it is being generated,
+    # retrying every poll interval, before it fails with "comfyui_connection_lost". 0 = fail on the first error.
+    comfyui_connection_grace_seconds: float = Field(30, ge=0, le=600)
+
+    # ------------------------------------------------------------- GPU generation envelope (see app/jobs/envelope.py)
+    # "unrestricted" (default, used with the mock provider) or a verified preset such as "t4_verified".
+    generation_profile: Literal["unrestricted", "t4_verified"] = "unrestricted"
+    # Each of these overrides the preset's value when set. Empty = use the preset (or no limit).
+    generation_allowed_modes: str = ""            # e.g. "t2v" or "t2v,i2v"
+    generation_allowed_resolutions: str = ""      # e.g. "832x480"
+    generation_max_frames: int | None = Field(None, ge=17, le=121)
+    generation_max_steps: int | None = Field(None, ge=1, le=60)
 
     # Mock provider tuning (development/tests only)
     mock_step_delay_seconds: float = Field(0.15, ge=0)
@@ -69,6 +81,20 @@ class Settings(BaseSettings):
     max_prompt_chars: int = Field(2000, ge=10, le=10000)
     min_image_side: int = Field(256, ge=16)
     max_image_side: int = Field(4096, ge=256)
+
+    @field_validator("generation_max_frames", "generation_max_steps", mode="before")
+    @classmethod
+    def _blank_limit_means_unset(cls, v):
+        return None if isinstance(v, str) and not v.strip() else v
+
+    @model_validator(mode="after")
+    def _check_gpu_envelope(self) -> Settings:
+        if self.generation_profile == "t4_verified" and self.inference_max_concurrent_jobs != 1:
+            raise ValueError("GENERATION_PROFILE=t4_verified requires INFERENCE_MAX_CONCURRENT_JOBS=1 "
+                             "(one GPU, proven only for one job at a time)")
+        from ..jobs.envelope import GenerationEnvelope   # validates the mode/resolution/frame overrides
+        GenerationEnvelope.from_settings(self)
+        return self
 
     @field_validator("comfyui_base_url", mode="after")
     @classmethod

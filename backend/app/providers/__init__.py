@@ -29,6 +29,7 @@ def build_provider(settings: Settings) -> InferenceProvider:
             timeout=settings.comfyui_timeout,
             client_id=settings.comfyui_client_id,
             poll_interval=settings.comfyui_poll_interval,
+            connection_grace=settings.comfyui_connection_grace_seconds,
             workflows=WorkflowTemplates(settings.comfyui_workflows_dir),  # validated here: fails fast
         )
     raise ValueError(f"Unknown inference provider {settings.inference_provider!r}")

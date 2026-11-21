@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from ..core.config import Settings
 from ..providers.base import GenerationRequest, InferenceProvider, ProviderError
 from ..storage import ObjectNotFound, Storage, output_key, upload_key
+from .envelope import GenerationEnvelope
 from .images import ValidatedImage
 from .models import GenerationParams, Job, JobError, JobStatus, new_job_id, utcnow
 from .repository import JobRepository
@@ -50,6 +51,7 @@ class JobManager:
         self.repo = repo
         self.storage = storage
         self.provider = provider
+        self.envelope = GenerationEnvelope.from_settings(settings)
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
         self._active: dict[str, _Active] = {}
@@ -59,7 +61,8 @@ class JobManager:
         self._recover()
         for i in range(self.settings.inference_max_concurrent_jobs):
             self._workers.append(asyncio.create_task(self._worker(), name=f"job-worker-{i}"))
-        log.info("Job manager started: provider=%s workers=%d", self.provider.name, len(self._workers))
+        log.info("Job manager started: provider=%s workers=%d limits=%s", self.provider.name, len(self._workers),
+                 self.envelope.summary())
 
     async def stop(self) -> None:
         for w in self._workers:

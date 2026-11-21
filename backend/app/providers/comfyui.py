@@ -70,6 +70,12 @@ _MAX_MESSAGE = 300
 _HEALTH_TTL = 10.0          # seconds a health result is reused (the UI polls /api/health)
 _NODE_CHECK_TTL = 600.0     # node classes rarely change: re-check every 10 minutes
 _LOST_AFTER_POLLS = 3       # consecutive polls with the prompt in neither queue nor history
+# Failures that mean "could not talk to ComfyUI right now" (a tunnel blip, a restart), as opposed to an answer.
+_TRANSIENT_CODES = frozenset({"comfyui_unreachable", "comfyui_timeout", "comfyui_server_error"})
+_DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_RETRY_STATUSES = frozenset({502, 503, 504})
+_GPU_OOM_MARKERS = ("out of memory", "allocation on device", "cublas_status_alloc_failed", "cudnn_status_alloc_failed")
+_SYSTEM_OOM_MARKERS = ("defaultcpuallocator", "can't allocate memory", "std::bad_alloc", "cannot allocate memory")
 
 
 def _short(text: Any, limit: int = _MAX_MESSAGE) -> str:
@@ -108,6 +114,8 @@ class ComfyUIProvider(InferenceProvider):
         timeout: float = 30.0,
         client_id: str = "",
         poll_interval: float = 2.0,
+        connection_grace: float = 30.0,
+        download_retry_delay: float = 1.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         if not base_url:
@@ -117,6 +125,8 @@ class ComfyUIProvider(InferenceProvider):
         self.timeout = timeout
         self.client_id = client_id or f"vidsgen-{uuid.uuid4().hex[:12]}"
         self.poll_interval = poll_interval
+        self.connection_grace = connection_grace          # seconds a running job tolerates a lost connection
+        self.download_retry_delay = download_retry_delay
         self._headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
         self._http = httpx.AsyncClient(
             base_url=self.base_url, headers=self._headers, timeout=httpx.Timeout(timeout),
@@ -345,9 +355,15 @@ class ComfyUIProvider(InferenceProvider):
         etype = str(data.get("exception_type") or "")
         emsg = str(data.get("exception_message") or "Unknown error")
         node_type = data.get("node_type") or "workflow"
-        if "OutOfMemory" in etype or "out of memory" in emsg.lower():
+        # The message is usually enough, but some OOMs only show in the exception type or the traceback.
+        trace = data.get("traceback")
+        haystack = " ".join([etype, emsg, " ".join(map(str, trace)) if isinstance(trace, list) else ""]).lower()
+        if "outofmemory" in etype.lower() or any(m in haystack for m in _GPU_OOM_MARKERS):
             return ProviderProgress("failed", 0, "The GPU ran out of memory. Try a smaller resolution or fewer frames.",
                                     error_code="gpu_out_of_memory")
+        if etype.rsplit(".", 1)[-1] == "MemoryError" or any(m in haystack for m in _SYSTEM_OOM_MARKERS):
+            return ProviderProgress("failed", 0, "The GPU server ran out of system memory (RAM). "
+                                    "Try a smaller resolution or fewer frames.", error_code="system_out_of_memory")
         return ProviderProgress("failed", 0, _short(f"ComfyUI error in {node_type}: {emsg}"),
                                 error_code="comfyui_execution_error")
 
@@ -450,34 +466,57 @@ class ComfyUIProvider(InferenceProvider):
     async def progress(self, provider_job_id: str) -> AsyncIterator[ProviderProgress]:
         run = self._get_run(provider_job_id)
         yield ProviderProgress("queued", 0.0, "queued on GPU server")
+        outage_since: float | None = None       # when the connection to ComfyUI was first lost (None = fine)
         while True:
-            if run.cancel_requested and run.events.empty():
-                # A deleted pending prompt produces no event: confirm by polling.
-                update = await self._poll(run)
-                if update is not None and update.state in ("cancelled", *_TERMINAL):
-                    yield update
-                    return
-            # With live events, poll only occasionally as a safety net; without them, or once a
-            # poll could not find the prompt (e.g. ComfyUI restarted), poll at the normal interval.
-            fast = not self._ws_connected.is_set() or run.lost_polls > 0
-            wait = self.poll_interval if fast else max(self.poll_interval * 5, 10.0)
             try:
-                kind, data = await asyncio.wait_for(run.events.get(), timeout=wait)
-            except TimeoutError:
-                update = await self._poll(run)
-            else:
-                if kind == "_ws_lost":
-                    update = await self._poll(run)
-                elif kind == "_cancelled":
-                    update = ProviderProgress("cancelled", run.percent, "cancelled")
-                else:
-                    mapped = self._from_event(run, kind, data)
-                    update = await self._verify(run) if mapped == "verify" else mapped
+                update = await self._next_update(run, outage_since is not None)
+            except ProviderError as e:
+                if e.code not in _TRANSIENT_CODES or self.connection_grace <= 0:
+                    raise
+                now = time.monotonic()
+                outage_since = now if outage_since is None else outage_since
+                lost_for = now - outage_since
+                if lost_for >= self.connection_grace:
+                    log.warning("ComfyUI connection lost for %.0fs while generating (%s)", lost_for, e.code)
+                    raise ProviderError(
+                        "comfyui_connection_lost",
+                        f"The connection to the GPU server was lost for more than {self.connection_grace:g} s while "
+                        "the video was being generated. The server may have restarted or crashed (for example from "
+                        "running out of memory). Please try again.") from None
+                log.warning("ComfyUI unreachable while generating (%s); retrying (%.0fs of %gs)", e.code, lost_for,
+                            self.connection_grace)
+                await asyncio.sleep(self.poll_interval)
+                continue
+            if outage_since is not None:
+                log.info("ComfyUI connection restored after %.0fs", time.monotonic() - outage_since)
+                outage_since = None
             if update is None:
                 continue
             yield update
             if update.state in _TERMINAL:
                 return
+
+    async def _next_update(self, run: _Run, in_outage: bool) -> ProviderProgress | None:
+        """Wait for the next event (or poll) and map it to progress. May raise a transient ProviderError."""
+        if run.cancel_requested and run.events.empty():
+            # A deleted pending prompt produces no event: confirm by polling.
+            update = await self._poll(run)
+            if update is not None and update.state in ("cancelled", *_TERMINAL):
+                return update
+        # With live events, poll only occasionally as a safety net; without them, after a poll could
+        # not find the prompt (e.g. ComfyUI restarted), or while the connection is down, poll at the normal interval.
+        fast = in_outage or not self._ws_connected.is_set() or run.lost_polls > 0
+        wait = self.poll_interval if fast else max(self.poll_interval * 5, 10.0)
+        try:
+            kind, data = await asyncio.wait_for(run.events.get(), timeout=wait)
+        except TimeoutError:
+            return await self._poll(run)
+        if kind == "_ws_lost":
+            return await self._poll(run)
+        if kind == "_cancelled":
+            return ProviderProgress("cancelled", run.percent, "cancelled")
+        mapped = self._from_event(run, kind, data)
+        return await self._verify(run) if mapped == "verify" else mapped
 
     # ================================================================== result
     async def fetch_result(self, provider_job_id: str) -> ProviderResult:
@@ -494,26 +533,44 @@ class ComfyUIProvider(InferenceProvider):
         workdir = Path(tempfile.mkdtemp(prefix="vidsgen-comfyui-"))
         path = workdir / "video.mp4"
         try:
-            async with self._http.stream("GET", "/view", params=params, timeout=max(self.timeout, 120)) as resp:
-                if resp.status_code != 200:
-                    raise ProviderError("output_download_failed", f"Downloading the video failed (HTTP {resp.status_code}).")
-                with open(path, "wb") as f:
-                    async for chunk in resp.aiter_bytes(1024 * 1024):
-                        f.write(chunk)
-            with open(path, "rb") as f:
-                head = f.read(12)
-            if len(head) < 12 or head[4:8] != b"ftyp":
-                raise ProviderError("unsupported_output", "The file from the GPU server is not a valid MP4 video.")
-        except httpx.TimeoutException:
-            shutil.rmtree(workdir, ignore_errors=True)
-            raise ProviderError("comfyui_timeout", "Downloading the video from the GPU server timed out.") from None
-        except httpx.HTTPError:
-            shutil.rmtree(workdir, ignore_errors=True)
-            raise ProviderError("comfyui_unreachable", "The GPU server became unreachable while downloading the video.") from None
+            await self._download(params, path)
         except BaseException:
             shutil.rmtree(workdir, ignore_errors=True)
             raise
         return ProviderResult(path=path, metadata=dict(video.get("metadata") or {}))
+
+    async def _download(self, params: dict[str, str], path: Path) -> None:
+        """GET /view into `path`, retrying (the download is idempotent) when the connection drops or a proxy
+        answers 502/503/504, so a short tunnel blip does not lose a video that was fully generated."""
+        for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+            last = attempt == _DOWNLOAD_ATTEMPTS
+            try:
+                async with self._http.stream("GET", "/view", params=params, timeout=max(self.timeout, 120)) as resp:
+                    if resp.status_code in _DOWNLOAD_RETRY_STATUSES and not last:
+                        log.warning("ComfyUI /view -> HTTP %s; retrying download (%d/%d)", resp.status_code, attempt,
+                                    _DOWNLOAD_ATTEMPTS)
+                        await asyncio.sleep(self.download_retry_delay)
+                        continue
+                    if resp.status_code != 200:
+                        raise ProviderError("output_download_failed",
+                                            f"Downloading the video failed (HTTP {resp.status_code}).")
+                    with open(path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(1024 * 1024):
+                            f.write(chunk)
+                with open(path, "rb") as f:
+                    head = f.read(12)
+                if len(head) < 12 or head[4:8] != b"ftyp":
+                    raise ProviderError("unsupported_output", "The file from the GPU server is not a valid MP4 video.")
+                return
+            except httpx.TimeoutException:
+                if last:
+                    raise ProviderError("comfyui_timeout", "Downloading the video from the GPU server timed out.") from None
+            except httpx.HTTPError:
+                if last:
+                    raise ProviderError("comfyui_unreachable",
+                                        "The GPU server became unreachable while downloading the video.") from None
+            log.warning("ComfyUI /view download interrupted; retrying (%d/%d)", attempt, _DOWNLOAD_ATTEMPTS)
+            await asyncio.sleep(self.download_retry_delay)
 
     # ================================================================== cancel / release
     async def cancel(self, provider_job_id: str) -> None:

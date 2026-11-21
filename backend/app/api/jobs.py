@@ -80,6 +80,12 @@ async def create_job(
     if mode == GenerationMode.t2v and has_image:
         raise _field_error("image", "images are not accepted for text-to-video; use mode=i2v")
 
+    # GPU envelope: reject what this server's GPU host has not been verified for, before reading the upload.
+    violations = manager.envelope.violations(params)
+    if violations:
+        raise RequestValidationError([
+            {"type": "value_error", "loc": ("body", field), "msg": msg, "input": None} for field, msg in violations])
+
     validated = None
     if has_image:
         data = await image.read(settings.max_upload_bytes + 1)
