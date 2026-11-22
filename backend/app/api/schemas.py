@@ -111,3 +111,88 @@ class ErrorDetail(BaseModel):
 
 class ErrorOut(BaseModel):
     detail: ErrorDetail
+
+
+# ---------------------------------------------------------------- GET /api/limits
+class ModeLimit(BaseModel):
+    value: GenerationMode
+    label: str
+    enabled: bool = Field(description="False = this server does not offer the mode; show it disabled and explain why")
+    reason: str | None = Field(description="Why it is disabled (None when enabled)")
+
+
+class ResolutionLimit(BaseModel):
+    value: str = Field(description="e.g. 832x480; send as the `resolution` form field")
+    width: int
+    height: int
+    enabled: bool
+    reason: str | None
+
+
+class FramesLimit(BaseModel):
+    min: int
+    max: int = Field(description="The largest frame count this server accepts")
+    step: int = Field(description="Valid counts are min, min+step, ... (always 4k+1)")
+    allowed: list[int] = Field(description="Every valid frame count")
+    limited: bool = Field(description="True if this server accepts fewer frames than the model supports")
+    reason: str | None
+
+
+class StepsLimit(BaseModel):
+    min: int
+    max: int
+    limited: bool
+    reason: str | None
+
+
+class RangeLimit(BaseModel):
+    min: float
+    max: float
+
+
+class IntRangeLimit(BaseModel):
+    min: int
+    max: int
+
+
+class PromptLimit(BaseModel):
+    max_chars: int
+
+
+class ImageLimit(BaseModel):
+    mime_types: list[str]
+    max_bytes: int
+    min_side: int
+    max_side: int
+
+
+class DefaultsOut(BaseModel):
+    """Starting values for a form. Every one is valid under the limits in the same response."""
+
+    mode: GenerationMode
+    resolution: str
+    num_frames: int
+    steps: int
+    fps: int
+    guidance_scale: float
+
+
+class LimitsOut(BaseModel):
+    """What this server will accept for a generation request, so a client can offer only valid choices and explain the rest.
+
+    Independent of GPU availability: it describes configuration, not provider state. POST /api/jobs enforces exactly these limits
+    (omitted form fields still take the API's own defaults, which may exceed them on a restricted server: send explicit values)."""
+
+    profile: str = Field(description="Active generation profile: `unrestricted` or a verified GPU profile such as `t4_verified`")
+    restricted: bool = Field(description="True if any limit below is stricter than the model's own")
+    max_concurrent_jobs: int = Field(description="Jobs run this many at a time; others wait in the queue")
+    modes: list[ModeLimit]
+    resolutions: list[ResolutionLimit]
+    num_frames: FramesLimit
+    steps: StepsLimit
+    fps: IntRangeLimit
+    guidance_scale: RangeLimit
+    seed: IntRangeLimit
+    prompt: PromptLimit
+    image: ImageLimit
+    defaults: DefaultsOut

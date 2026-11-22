@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from . import __version__
-from .api import health, jobs
+from .api import health, jobs, limits
 from .core.config import Settings, get_settings
 from .jobs.manager import JobManager
 from .jobs.repository import JobRepository
@@ -59,7 +59,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         repo = JobRepository(settings.database_path)
         storage = build_storage(settings)
         provider = build_provider(settings)
-        manager = JobManager(settings, repo, storage, provider)
+        try:
+            manager = JobManager(settings, repo, storage, provider)
+        except BaseException:                 # e.g. inconsistent generation limits: release what was opened before refusing to start
+            await provider.aclose()
+            repo.close()
+            raise
         app.state.manager = manager
         await manager.start()
         log.info("VIDSGEN API %s ready (env=%s, provider=%s, storage=%s at %s)", __version__, settings.app_env,
@@ -98,6 +103,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(jobs.router)
+    app.include_router(limits.router)
 
     @app.get("/", include_in_schema=False)
     async def root():

@@ -106,6 +106,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/limits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Generation limits and defaults for this server
+         * @description The active generation capabilities: which modes and resolutions are offered, valid frame counts, step/fps/guidance ranges, upload
+         *     and prompt limits, and starting values. Computed from the same configuration that validates `POST /api/jobs`; it never contacts
+         *     the GPU provider and contains no URLs, credentials or paths.
+         */
+        get: operations["limits_api_limits_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -176,6 +198,23 @@ export interface components {
              */
             checks?: components["schemas"]["HealthCheckOut"][];
         };
+        /**
+         * DefaultsOut
+         * @description Starting values for a form. Every one is valid under the limits in the same response.
+         */
+        DefaultsOut: {
+            mode: components["schemas"]["GenerationMode"];
+            /** Resolution */
+            resolution: string;
+            /** Num Frames */
+            num_frames: number;
+            /** Steps */
+            steps: number;
+            /** Fps */
+            fps: number;
+            /** Guidance Scale */
+            guidance_scale: number;
+        };
         /** ErrorDetail */
         ErrorDetail: {
             /** Code */
@@ -186,6 +225,33 @@ export interface components {
         /** ErrorOut */
         ErrorOut: {
             detail: components["schemas"]["ErrorDetail"];
+        };
+        /** FramesLimit */
+        FramesLimit: {
+            /** Min */
+            min: number;
+            /**
+             * Max
+             * @description The largest frame count this server accepts
+             */
+            max: number;
+            /**
+             * Step
+             * @description Valid counts are min, min+step, ... (always 4k+1)
+             */
+            step: number;
+            /**
+             * Allowed
+             * @description Every valid frame count
+             */
+            allowed: number[];
+            /**
+             * Limited
+             * @description True if this server accepts fewer frames than the model supports
+             */
+            limited: boolean;
+            /** Reason */
+            reason: string | null;
         };
         /**
          * GenerationMode
@@ -234,6 +300,17 @@ export interface components {
                 [key: string]: number;
             };
         };
+        /** ImageLimit */
+        ImageLimit: {
+            /** Mime Types */
+            mime_types: string[];
+            /** Max Bytes */
+            max_bytes: number;
+            /** Min Side */
+            min_side: number;
+            /** Max Side */
+            max_side: number;
+        };
         /** InputImageOut */
         InputImageOut: {
             /** Width */
@@ -244,6 +321,13 @@ export interface components {
             original_format: string;
             /** Original Size Bytes */
             original_size_bytes: number;
+        };
+        /** IntRangeLimit */
+        IntRangeLimit: {
+            /** Min */
+            min: number;
+            /** Max */
+            max: number;
         };
         /** JobError */
         JobError: {
@@ -325,6 +409,86 @@ export interface components {
          * @enum {string}
          */
         JobStatus: "queued" | "processing" | "completed" | "failed" | "cancelled";
+        /**
+         * LimitsOut
+         * @description What this server will accept for a generation request, so a client can offer only valid choices and explain the rest.
+         *
+         *     Independent of GPU availability: it describes configuration, not provider state. POST /api/jobs enforces exactly these limits
+         *     (omitted form fields still take the API's own defaults, which may exceed them on a restricted server: send explicit values).
+         */
+        LimitsOut: {
+            /**
+             * Profile
+             * @description Active generation profile: `unrestricted` or a verified GPU profile such as `t4_verified`
+             */
+            profile: string;
+            /**
+             * Restricted
+             * @description True if any limit below is stricter than the model's own
+             */
+            restricted: boolean;
+            /**
+             * Max Concurrent Jobs
+             * @description Jobs run this many at a time; others wait in the queue
+             */
+            max_concurrent_jobs: number;
+            /** Modes */
+            modes: components["schemas"]["ModeLimit"][];
+            /** Resolutions */
+            resolutions: components["schemas"]["ResolutionLimit"][];
+            num_frames: components["schemas"]["FramesLimit"];
+            steps: components["schemas"]["StepsLimit"];
+            fps: components["schemas"]["IntRangeLimit"];
+            guidance_scale: components["schemas"]["RangeLimit"];
+            seed: components["schemas"]["IntRangeLimit"];
+            prompt: components["schemas"]["PromptLimit"];
+            image: components["schemas"]["ImageLimit"];
+            defaults: components["schemas"]["DefaultsOut"];
+        };
+        /** ModeLimit */
+        ModeLimit: {
+            value: components["schemas"]["GenerationMode"];
+            /** Label */
+            label: string;
+            /**
+             * Enabled
+             * @description False = this server does not offer the mode; show it disabled and explain why
+             */
+            enabled: boolean;
+            /**
+             * Reason
+             * @description Why it is disabled (None when enabled)
+             */
+            reason: string | null;
+        };
+        /** PromptLimit */
+        PromptLimit: {
+            /** Max Chars */
+            max_chars: number;
+        };
+        /** RangeLimit */
+        RangeLimit: {
+            /** Min */
+            min: number;
+            /** Max */
+            max: number;
+        };
+        /** ResolutionLimit */
+        ResolutionLimit: {
+            /**
+             * Value
+             * @description e.g. 832x480; send as the `resolution` form field
+             */
+            value: string;
+            /** Width */
+            width: number;
+            /** Height */
+            height: number;
+            /** Enabled */
+            enabled: boolean;
+            /** Reason */
+            reason: string | null;
+        };
         /** ResultOut */
         ResultOut: {
             /**
@@ -344,6 +508,17 @@ export interface components {
              * @description Same file served inline, for <video src>
              */
             preview_url: string;
+        };
+        /** StepsLimit */
+        StepsLimit: {
+            /** Min */
+            min: number;
+            /** Max */
+            max: number;
+            /** Limited */
+            limited: boolean;
+            /** Reason */
+            reason: string | null;
         };
         /** ValidationError */
         ValidationError: {
@@ -616,6 +791,35 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    limits_api_limits_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LimitsOut"];
+                };
+            };
+            /** @description The server's generation limits are misconfigured */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorOut"];
                 };
             };
         };

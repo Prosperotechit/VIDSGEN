@@ -352,6 +352,38 @@
           }
         }
       }
+    },
+    "/api/limits": {
+      "get": {
+        "tags": [
+          "limits"
+        ],
+        "summary": "Generation limits and defaults for this server",
+        "description": "The active generation capabilities: which modes and resolutions are offered, valid frame counts, step/fps/guidance ranges, upload\nand prompt limits, and starting values. Computed from the same configuration that validates `POST /api/jobs`; it never contacts\nthe GPU provider and contains no URLs, credentials or paths.",
+        "operationId": "limits_api_limits_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LimitsOut"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server's generation limits are misconfigured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOut"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -462,6 +494,44 @@
         ],
         "title": "ComponentHealth"
       },
+      "DefaultsOut": {
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/GenerationMode"
+          },
+          "resolution": {
+            "type": "string",
+            "title": "Resolution"
+          },
+          "num_frames": {
+            "type": "integer",
+            "title": "Num Frames"
+          },
+          "steps": {
+            "type": "integer",
+            "title": "Steps"
+          },
+          "fps": {
+            "type": "integer",
+            "title": "Fps"
+          },
+          "guidance_scale": {
+            "type": "number",
+            "title": "Guidance Scale"
+          }
+        },
+        "type": "object",
+        "required": [
+          "mode",
+          "resolution",
+          "num_frames",
+          "steps",
+          "fps",
+          "guidance_scale"
+        ],
+        "title": "DefaultsOut",
+        "description": "Starting values for a form. Every one is valid under the limits in the same response."
+      },
       "ErrorDetail": {
         "properties": {
           "code": {
@@ -491,6 +561,58 @@
           "detail"
         ],
         "title": "ErrorOut"
+      },
+      "FramesLimit": {
+        "properties": {
+          "min": {
+            "type": "integer",
+            "title": "Min"
+          },
+          "max": {
+            "type": "integer",
+            "title": "Max",
+            "description": "The largest frame count this server accepts"
+          },
+          "step": {
+            "type": "integer",
+            "title": "Step",
+            "description": "Valid counts are min, min+step, ... (always 4k+1)"
+          },
+          "allowed": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Allowed",
+            "description": "Every valid frame count"
+          },
+          "limited": {
+            "type": "boolean",
+            "title": "Limited",
+            "description": "True if this server accepts fewer frames than the model supports"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "min",
+          "max",
+          "step",
+          "allowed",
+          "limited",
+          "reason"
+        ],
+        "title": "FramesLimit"
       },
       "GenerationMode": {
         "type": "string",
@@ -586,6 +708,37 @@
         ],
         "title": "HealthOut"
       },
+      "ImageLimit": {
+        "properties": {
+          "mime_types": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Mime Types"
+          },
+          "max_bytes": {
+            "type": "integer",
+            "title": "Max Bytes"
+          },
+          "min_side": {
+            "type": "integer",
+            "title": "Min Side"
+          },
+          "max_side": {
+            "type": "integer",
+            "title": "Max Side"
+          }
+        },
+        "type": "object",
+        "required": [
+          "mime_types",
+          "max_bytes",
+          "min_side",
+          "max_side"
+        ],
+        "title": "ImageLimit"
+      },
       "InputImageOut": {
         "properties": {
           "width": {
@@ -613,6 +766,24 @@
           "original_size_bytes"
         ],
         "title": "InputImageOut"
+      },
+      "IntRangeLimit": {
+        "properties": {
+          "min": {
+            "type": "integer",
+            "title": "Min"
+          },
+          "max": {
+            "type": "integer",
+            "title": "Max"
+          }
+        },
+        "type": "object",
+        "required": [
+          "min",
+          "max"
+        ],
+        "title": "IntRangeLimit"
       },
       "JobError": {
         "properties": {
@@ -844,6 +1015,189 @@
         ],
         "title": "JobStatus"
       },
+      "LimitsOut": {
+        "properties": {
+          "profile": {
+            "type": "string",
+            "title": "Profile",
+            "description": "Active generation profile: `unrestricted` or a verified GPU profile such as `t4_verified`"
+          },
+          "restricted": {
+            "type": "boolean",
+            "title": "Restricted",
+            "description": "True if any limit below is stricter than the model's own"
+          },
+          "max_concurrent_jobs": {
+            "type": "integer",
+            "title": "Max Concurrent Jobs",
+            "description": "Jobs run this many at a time; others wait in the queue"
+          },
+          "modes": {
+            "items": {
+              "$ref": "#/components/schemas/ModeLimit"
+            },
+            "type": "array",
+            "title": "Modes"
+          },
+          "resolutions": {
+            "items": {
+              "$ref": "#/components/schemas/ResolutionLimit"
+            },
+            "type": "array",
+            "title": "Resolutions"
+          },
+          "num_frames": {
+            "$ref": "#/components/schemas/FramesLimit"
+          },
+          "steps": {
+            "$ref": "#/components/schemas/StepsLimit"
+          },
+          "fps": {
+            "$ref": "#/components/schemas/IntRangeLimit"
+          },
+          "guidance_scale": {
+            "$ref": "#/components/schemas/RangeLimit"
+          },
+          "seed": {
+            "$ref": "#/components/schemas/IntRangeLimit"
+          },
+          "prompt": {
+            "$ref": "#/components/schemas/PromptLimit"
+          },
+          "image": {
+            "$ref": "#/components/schemas/ImageLimit"
+          },
+          "defaults": {
+            "$ref": "#/components/schemas/DefaultsOut"
+          }
+        },
+        "type": "object",
+        "required": [
+          "profile",
+          "restricted",
+          "max_concurrent_jobs",
+          "modes",
+          "resolutions",
+          "num_frames",
+          "steps",
+          "fps",
+          "guidance_scale",
+          "seed",
+          "prompt",
+          "image",
+          "defaults"
+        ],
+        "title": "LimitsOut",
+        "description": "What this server will accept for a generation request, so a client can offer only valid choices and explain the rest.\n\nIndependent of GPU availability: it describes configuration, not provider state. POST /api/jobs enforces exactly these limits\n(omitted form fields still take the API's own defaults, which may exceed them on a restricted server: send explicit values)."
+      },
+      "ModeLimit": {
+        "properties": {
+          "value": {
+            "$ref": "#/components/schemas/GenerationMode"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled",
+            "description": "False = this server does not offer the mode; show it disabled and explain why"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason",
+            "description": "Why it is disabled (None when enabled)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "label",
+          "enabled",
+          "reason"
+        ],
+        "title": "ModeLimit"
+      },
+      "PromptLimit": {
+        "properties": {
+          "max_chars": {
+            "type": "integer",
+            "title": "Max Chars"
+          }
+        },
+        "type": "object",
+        "required": [
+          "max_chars"
+        ],
+        "title": "PromptLimit"
+      },
+      "RangeLimit": {
+        "properties": {
+          "min": {
+            "type": "number",
+            "title": "Min"
+          },
+          "max": {
+            "type": "number",
+            "title": "Max"
+          }
+        },
+        "type": "object",
+        "required": [
+          "min",
+          "max"
+        ],
+        "title": "RangeLimit"
+      },
+      "ResolutionLimit": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "e.g. 832x480; send as the `resolution` form field"
+          },
+          "width": {
+            "type": "integer",
+            "title": "Width"
+          },
+          "height": {
+            "type": "integer",
+            "title": "Height"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "width",
+          "height",
+          "enabled",
+          "reason"
+        ],
+        "title": "ResolutionLimit"
+      },
       "ResultOut": {
         "properties": {
           "content_type": {
@@ -880,6 +1234,41 @@
           "preview_url"
         ],
         "title": "ResultOut"
+      },
+      "StepsLimit": {
+        "properties": {
+          "min": {
+            "type": "integer",
+            "title": "Min"
+          },
+          "max": {
+            "type": "integer",
+            "title": "Max"
+          },
+          "limited": {
+            "type": "boolean",
+            "title": "Limited"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "min",
+          "max",
+          "limited",
+          "reason"
+        ],
+        "title": "StepsLimit"
       },
       "ValidationError": {
         "properties": {

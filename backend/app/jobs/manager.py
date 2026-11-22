@@ -23,6 +23,7 @@ from ..providers.base import GenerationRequest, InferenceProvider, ProviderError
 from ..storage import ObjectNotFound, Storage, output_key, upload_key
 from .envelope import GenerationEnvelope
 from .images import ValidatedImage
+from .limits import build_limits
 from .models import GenerationParams, Job, JobError, JobStatus, new_job_id, utcnow
 from .repository import JobRepository
 
@@ -52,6 +53,7 @@ class JobManager:
         self.storage = storage
         self.provider = provider
         self.envelope = GenerationEnvelope.from_settings(settings)
+        build_limits(self.envelope, settings)       # fail at startup (LimitsError) rather than ever advertise limits we cannot honour
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
         self._active: dict[str, _Active] = {}
