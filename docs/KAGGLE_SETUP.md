@@ -164,6 +164,12 @@ the same version, is rejected). The host's installed packages are inventoried be
 an existing venv (with or without its own pip) is reused. ComfyUI's own pins (frontend 1.59.6, templates 0.11.111, …) are installed as
 specified. After start, `check-templates` validates both workflow templates against that server's `/object_info`.
 
+### Public tunnel: NOT approved (read this before the section below)
+Kaggle's Terms restrict use to internal, personal, non-commercial purposes and its Acceptable Use Policy lists server farming among prohibited
+resource abuse, so permission for a public tunnel is **not established**. The design below is kept for reference; do not use a tunnel on
+Kaggle until Kaggle Support has said yes in writing. See [KAGGLE_TUNNEL_FEASIBILITY.md](KAGGLE_TUNNEL_FEASIBILITY.md) and
+[KAGGLE_SUPPORT_QUESTION.md](KAGGLE_SUPPORT_QUESTION.md).
+
 ### Secure connection (5B)
 
 ```

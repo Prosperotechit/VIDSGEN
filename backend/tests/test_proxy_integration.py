@@ -169,7 +169,8 @@ def test_a_429_from_the_proxy_is_reported_as_busy_and_never_resubmitted(make_cli
         job = wait_for(c, submit(c, **PROVEN).json()["id"], timeout=30)
         time.sleep(1.5)
     assert job["status"] == "failed" and job["error"] == {"code": "comfyui_busy", "message": "The GPU server is busy; try again shortly."}
-    assert fake.requests == [] and app.state.registry.entries == {}                       # nothing forwarded, nothing remembered
+    assert [r for r in fake.requests if r["method"] == "POST"] == []                      # nothing forwarded (only the read-only existence check ran)
+    assert app.state.registry.entries == {}                                               # and nothing remembered
 
 
 def test_a_429_while_tracking_a_job_is_retried_within_the_grace_period(make_client, fake):

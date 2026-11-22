@@ -21,6 +21,15 @@ path-scrubbed, only for prompts this proxy forwarded), streamed MP4 downloads wi
 concurrency-safe prompt_id idempotency (a reused id with a different payload is refused, a duplicate is never forwarded twice),
 read-only reconciliation of uncertain submissions (it never resubmits), and an optional dead-man switch (OFF by default).
 
+Stage 4A adds a read-only PRE-FORWARD existence check: before a prompt_id the proxy has not seen is forwarded, ComfyUI's history and
+queue are asked (GET only) whether it already knows that id; if so, the submission is answered as already accepted and is NOT forwarded
+again. This narrows the double-run window after a proxy restart, but it can NOT guarantee exactly-once execution:
+  * a prompt that ComfyUI has accepted but not yet made visible in /queue or /history (a visibility race) looks "unknown";
+  * a first request that is still in flight on another (older) proxy instance cannot be seen at all;
+  * "known" is judged by prompt_id alone: the payload behind an id remembered only by ComfyUI cannot be compared;
+  * if ComfyUI cannot be asked, the proxy does not forward (it answers 502) rather than guess.
+Nothing here ever resubmits an uncertain request automatically. A bounded --max-lifetime-seconds is also available for short, supervised runs.
+
 Still not here: the tunnel (a later, separately approved stage).
 
     PROXY_API_TOKEN=<>=32 random chars>  python inference_proxy.py --upstream http://127.0.0.1:8188 --port 8189 \
@@ -107,6 +116,7 @@ class Policy:
     dead_man_seconds: float = 0.0       # 0 = disabled (the default). When enabled, at least dead_man_min.
     dead_man_min: float = 120.0
     dead_man_interval: float = 15.0
+    preforward_check: bool = True       # read-only "does ComfyUI already know this prompt_id?" before forwarding a new one
 
 
 class Rejected(Exception):
@@ -636,7 +646,18 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
             return _refusal(409, "the outcome of the earlier submission is unknown and it was not resubmitted; "
                                  "check the job's status, or use a new prompt_id")
 
-        # kind == "new": this call forwards it (duplicates and replays above never take a GPU-work slot)
+        # kind == "new": this proxy has not seen the id. Look (read-only) before forwarding: ComfyUI may already know it (e.g. this proxy
+        # restarted). This narrows, but cannot close, the double-run window: see the module docstring for what it cannot guarantee.
+        if policy.preforward_check:
+            known, number = await reconcile(pid)
+            if known:
+                out = {"prompt_id": pid, "number": number, "node_errors": {}}
+                registry.resolve(pid, 200, out)
+                return _reply(200, out, replay="existing-unverified")
+            if known is None:                                    # ComfyUI could not be asked: do not forward blind
+                registry.reject(pid, 502, {"error": "upstream_error"})
+                return _reply(502, {"error": "upstream_error"})
+        # (known is False: nothing visible yet) this call forwards it; duplicates and replays above never take a GPU-work slot
         if state["heavy"] >= policy.max_heavy:
             registry.reject(pid, 429, {"error": "busy"})         # nothing was sent: forget the id
             return JSONResponse({"error": "busy"}, status_code=429, headers={"Retry-After": "2"})
@@ -715,6 +736,9 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
             raise Rejected("the GPU server did not respond in time", 504) from None
         except httpx.HTTPError:
             raise Rejected("the GPU server is unreachable", 502) from None
+        if up.status_code == 416:
+            await up.aclose()
+            raise Rejected("range not satisfiable", 416)
         if up.status_code not in (200, 206):
             await up.aclose()
             raise Rejected("not found" if up.status_code == 404 else "the GPU server returned an error", 404 if up.status_code == 404 else 502)
@@ -908,6 +932,8 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
             pending = {i[1] for i in queue.get("queue_pending", []) if isinstance(i, list) and len(i) > 1}
             reaped = 0
             for pid in ids:
+                if state["ws"] or clock() - state["last_activity"] < policy.dead_man_seconds:
+                    break                                         # the backend spoke while we were looking: it is alive, stop at once
                 if pid in pending:
                     registry.cancel(pid)
                     await upstream_json("POST", "/queue", {"delete": [pid]})
@@ -970,9 +996,21 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
     return app
 
 
+class SafeParser(argparse.ArgumentParser):
+    """argparse echoes unrecognised arguments in its error text; if someone pastes a token as an option, it must not be printed back."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)            # "--token" must not silently become "--token-env"
+        super().__init__(*args, **kwargs)
+
+    def error(self, message):
+        import re as _re
+        super().error(_re.sub(r"[A-Za-z0-9_\-]{24,}", "[redacted]", message))
+
+
 # ===================================================================================== CLI
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = SafeParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--upstream", default="http://127.0.0.1:8188")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8189)
@@ -980,7 +1018,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dead-man-seconds", type=float, default=0.0,
                     help="OFF by default (0). If set (minimum 120): cancel prompts this proxy forwarded when the backend has been "
                          "completely silent (no request and no open WebSocket) for this long")
+    ap.add_argument("--max-lifetime-seconds", type=float, default=0.0,
+                    help="OFF by default (0). If set, the proxy shuts itself down gracefully after this many seconds (for short, supervised runs)")
     a = ap.parse_args(argv)
+    if a.max_lifetime_seconds < 0 or a.max_lifetime_seconds > 86400:
+        print("FAILED: --max-lifetime-seconds must be between 0 (off) and 86400.", file=sys.stderr)
+        return 2
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         print("FAILED: the proxy listens on loopback only in this stage (making it reachable is a separate, approved step).", file=sys.stderr)
         return 2
@@ -993,7 +1036,14 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    uvicorn.run(app, host=a.host, port=a.port, **uvicorn_options())
+    server = uvicorn.Server(uvicorn.Config(app, host=a.host, port=a.port, **uvicorn_options()))
+    if a.max_lifetime_seconds > 0:
+        import threading
+
+        timer = threading.Timer(a.max_lifetime_seconds, lambda: setattr(server, "should_exit", True))
+        timer.daemon = True
+        timer.start()
+    server.run()
     return 0
 
 

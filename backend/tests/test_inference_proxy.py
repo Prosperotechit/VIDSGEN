@@ -647,7 +647,11 @@ def test_comfyuis_own_validation_error_is_passed_on_with_paths_removed():
     up = {"error": {"type": "prompt_outputs_failed_validation", "message": "Prompt outputs failed validation", "details": "", "extra_info": {}},
           "node_errors": {"39": {"errors": [{"type": "value_not_in_list", "details": "vae_name: x not in [/kaggle/tmp/vidsgen-gpu/comfy-data/models/vae/a.safetensors]"}],
                                  "class_type": "VAELoader"}}, "secret_extra": "dropped"}
-    with mocked(lambda req: httpx.Response(400, json=up)) as c:
+    def handler(req):                      # (the proxy first asks, read-only, whether ComfyUI already knows the id)
+        if req.method == "POST":
+            return httpx.Response(400, json=up)
+        return httpx.Response(200, json={"queue_running": [], "queue_pending": []} if req.url.path == "/queue" else {})
+    with mocked(handler) as c:
         r = c.post("/prompt", json=prompt_body(), headers=AUTH)
     assert r.status_code == 400 and set(r.json()) == {"error", "node_errors"} and "/kaggle" not in r.text and "<path>" in r.text
 

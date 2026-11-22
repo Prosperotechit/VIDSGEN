@@ -1,0 +1,8 @@
+{
+  "_comment": "Pins for the cloudflared binary a FUTURE tunnel test would use. Nothing is pinned yet: version and every sha256 are null, so scripts/cloudflared_pin.py REFUSES to download or approve any binary. To pin (a separate, reviewed step before Stage 4B): choose a release, take the SHA-256 of each asset from the official release page, verify it independently a second time, then fill the values in and commit them for review. Never pin a hash computed from a binary you have not otherwise verified.",
+  "version": null,
+  "assets": {
+    "linux-amd64": { "asset": "cloudflared-linux-amd64", "sha256": null, "max_bytes": 104857600 },
+    "linux-arm64": { "asset": "cloudflared-linux-arm64", "sha256": null, "max_bytes": 104857600 }
+  }
+}
