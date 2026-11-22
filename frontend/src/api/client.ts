@@ -2,6 +2,8 @@
 // The frontend talks ONLY to the VIDSGEN FastAPI backend: never to ComfyUI, Hugging Face
 // or any GPU provider directly.
 
+import { redactSensitive } from "./redact";
+
 const RAW_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
 /** API origin without trailing slash. Empty string = same origin (dev proxy / same domain). */
 export const API_BASE_URL = RAW_BASE.replace(/\/+$/, "");
@@ -24,7 +26,7 @@ export class ApiError extends Error {
   readonly fieldErrors: FieldError[];
 
   constructor(message: string, opts: { status: number; code: string; fieldErrors?: FieldError[] }) {
-    super(message);
+    super(redactSensitive(message));      // nothing that reaches the UI may carry a credential, URL, address or file path
     this.name = "ApiError";
     this.status = opts.status;
     this.code = opts.code;
@@ -42,7 +44,7 @@ interface ValidationItem {
 }
 
 // Pydantic prefixes custom validator messages with "Value error, ". Strip it for display.
-const cleanMsg = (m: string) => m.replace(/^Value error,\s*/i, "");
+const cleanMsg = (m: string) => redactSensitive(m.replace(/^Value error,\s*/i, ""));
 
 /** Parses the backend's two error formats into an ApiError. Exported for tests. */
 export function parseErrorBody(status: number, body: unknown): ApiError {

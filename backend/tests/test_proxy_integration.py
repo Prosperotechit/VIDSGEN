@@ -58,7 +58,7 @@ async def wait_until(pred, timeout=5.0):
     return False
 
 
-def wait_sync(pred, timeout=8.0) -> bool:
+def wait_sync(pred, timeout=30.0) -> bool:
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         if pred():
@@ -179,7 +179,7 @@ def test_a_429_while_tracking_a_job_is_retried_within_the_grace_period(make_clie
         c = e2e_client(make_client, p, comfyui_connection_grace_seconds=20)
         job_id = submit(c).json()["id"]
         wait_for(c, job_id, statuses={"processing"})
-        assert wait_sync(lambda: fake._pending)
+        fake.wait_pending()
         fake.outage, fake.outage_status = True, 429
         time.sleep(1.2)
         assert c.get(f"/api/jobs/{job_id}").json()["status"] == "processing"
@@ -273,9 +273,9 @@ def test_cancelling_a_running_job_sends_a_targeted_interrupt_through_the_proxy(m
         c = e2e_client(make_client, p)
         job_id = submit(c, **PROVEN).json()["id"]
         wait_for(c, job_id, statuses={"processing"})
-        assert wait_sync(lambda: fake._running is not None)
+        fake.wait_until(lambda: fake._running is not None, what="a prompt to start running")
         assert c.post(f"/api/jobs/{job_id}/cancel").json()["status"] == "cancelled"
-        assert wait_sync(lambda: fake.interrupts)
+        fake.wait_interrupt()
         pid = prompts(fake)[0]["body"]["prompt_id"]
         assert fake.interrupts == [pid]                                                  # targeted, never a global interrupt
         assert app.state.registry.entries[pid].state == "cancelled"                       # tombstoned at the proxy
@@ -291,10 +291,10 @@ def test_cancelling_a_queued_job_removes_it_from_the_comfyui_queue(make_client, 
         c = e2e_client(make_client, p)
         job_id = submit(c, **PROVEN).json()["id"]
         wait_for(c, job_id, statuses={"processing"})
-        assert wait_sync(lambda: fake._pending)
+        fake.wait_pending()
         pid = prompts(fake)[0]["body"]["prompt_id"]
         assert c.post(f"/api/jobs/{job_id}/cancel").json()["status"] == "cancelled"
-        assert wait_sync(lambda: pid in fake.deleted)
+        fake.wait_until(lambda: pid in fake.deleted, what="the queue deletion")
         assert fake.interrupts == [] and [r for r in fake.requests if r["method"] == "POST" and r["path"] == "/queue"][0]["body"] == {"delete": [pid]}
         assert app.state.registry.entries[pid].state == "cancelled"
 
@@ -344,7 +344,7 @@ def test_a_short_proxy_restart_during_a_job_is_survived(make_client, fake, video
     with ProxyServer(make_app(fake.url), port):
         job_id = submit(c, **PROVEN).json()["id"]
         wait_for(c, job_id, statuses={"processing"})
-        assert wait_sync(lambda: fake._pending)
+        fake.wait_pending()
     time.sleep(1.5)                                                                       # proxy down: polls fail, the job waits
     assert c.get(f"/api/jobs/{job_id}").json()["status"] == "processing"
     with ProxyServer(make_app(fake.url), port):                                           # a fresh proxy: its idempotency memory is empty
@@ -361,7 +361,7 @@ def test_an_outage_longer_than_the_grace_period_fails_the_job_without_resubmitti
         c = e2e_client(make_client, p, comfyui_connection_grace_seconds=2)
         job_id = submit(c, **PROVEN).json()["id"]
         wait_for(c, job_id, statuses={"processing"})
-        assert wait_sync(lambda: fake._pending)
+        fake.wait_pending()
         fake.outage = True                                                                # the proxy answers 503: ComfyUI is unreachable behind it
         job = wait_for(c, job_id, timeout=30)
         fake.outage = False

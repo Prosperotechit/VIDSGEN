@@ -903,20 +903,33 @@ def create_app(upstream_url: str, token: str, workflows_dir: Path, policy: Polic
             state["ws_tasks"].update(tasks)
             await asyncio.wait(tasks, timeout=policy.ws_max_seconds, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            state["ws_tasks"].difference_update(tasks)
-            state["ws"].discard(cid)
-            state["last_activity"] = clock()
-            if upstream is not None:
-                await upstream.close()
-            if ws.client_state == WebSocketState.CONNECTED:
+            # Teardown must complete even if THIS handler is cancelled while it runs (a server shutdown, or a test client that cancels the
+            # app right after disconnecting): every step is in its own try/finally, the slot is released last (so "slot free" means
+            # "everything closed"), and a socket that could not be closed gracefully is aborted rather than leaked.
+            try:
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
                 try:
-                    # A stalled client never drains its socket, so even a close frame can block: bound it, then let uvicorn drop the connection.
-                    await asyncio.wait_for(ws.close(code=1000), 2.0)
-                except (RuntimeError, WebSocketDisconnect, TimeoutError):
-                    pass
+                    if upstream is not None:
+                        try:
+                            await asyncio.wait_for(upstream.close(), 2.0)
+                        except (Exception, asyncio.TimeoutError):
+                            pass
+                finally:
+                    if upstream is not None and getattr(upstream, "transport", None) is not None:
+                        upstream.transport.abort()               # no-op when already closed; never leaves the socket open
+                    try:
+                        if ws.client_state == WebSocketState.CONNECTED:
+                            # A stalled client never drains its socket, so even a close frame can block: bound it.
+                            await asyncio.wait_for(ws.close(code=1000), 2.0)
+                    except (RuntimeError, WebSocketDisconnect, TimeoutError):
+                        pass
+                    finally:
+                        state["ws_tasks"].difference_update(tasks)
+                        state["ws"].discard(cid)
+                        state["last_activity"] = clock()
 
     # ------------------------------------------------------------------ optional dead-man switch (disabled unless configured)
     async def reap_once() -> int:

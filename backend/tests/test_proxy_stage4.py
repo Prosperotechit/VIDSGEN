@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from test_inference_proxy import AUTH, TOKEN, WORKFLOWS, JOB, fake, free_port, make_app, px, video_bytes  # noqa: F401
-from test_inference_proxy_stage2 import Clock, body_for, dm_app, new_id, prompts, tick
+from test_inference_proxy_stage2 import Clock, body_for, dm_app, new_id, prompts, tick, ws_session
 
 SCRIPT = px.__file__
 
@@ -30,9 +30,7 @@ def test_an_id_comfyui_already_knows_is_not_forwarded_again_even_after_a_proxy_r
     body = body_for(pid=pid)
     with TestClient(make_app(fake.url)) as c1:
         assert c1.post("/prompt", json=body, headers=AUTH).status_code == 200
-    deadline = time.monotonic() + 10
-    while pid not in fake.history and time.monotonic() < deadline:
-        time.sleep(0.02)
+    fake.wait_history(pid)                                                        # ComfyUI has really recorded it
     with TestClient(make_app(fake.url)) as c2:                                    # a restarted proxy: its memory is empty
         r = c2.post("/prompt", json=body, headers=AUTH)
     assert r.status_code == 200 and r.headers["x-idempotent-replay"] == "existing-unverified" and r.json()["prompt_id"] == pid
@@ -168,7 +166,7 @@ def test_an_open_websocket_protects_every_tracked_job_however_long_it_has_run(fa
     with TestClient(app) as c:
         pid = new_id()
         c.post("/prompt", json=body_for(pid=pid), headers=AUTH)
-        with c.websocket_connect("/ws?clientId=vidsgen-abcdef012345", headers=AUTH):
+        with ws_session(c, app, "vidsgen-abcdef012345"):
             for _ in range(50):
                 clock.t += 3600                                                   # 50 hours with no HTTP request at all
                 assert tick(c, app) == 0
@@ -221,19 +219,10 @@ def test_a_silent_backend_is_still_reaped_with_a_targeted_call(fake):
     with TestClient(app) as c:
         pid = new_id()
         c.post("/prompt", json=body_for(pid=pid), headers=AUTH)
-        deadline = time.monotonic() + 5
-        while fake._running != pid and time.monotonic() < deadline:
-            time.sleep(0.02)
+        fake.wait_running(pid)
         clock.t += 301
         assert tick(c, app) == 1
-        assert wait_for_interrupt(fake) == [pid]
-
-
-def wait_for_interrupt(fake):
-    deadline = time.monotonic() + 5
-    while not fake.interrupts and time.monotonic() < deadline:
-        time.sleep(0.02)
-    return fake.interrupts
+        assert fake.wait_interrupt() == [pid]
 
 
 # ====================================================================== --max-lifetime-seconds

@@ -12,6 +12,7 @@ export type JobParams = S["JobParamsOut"];
 export type JobResult = S["ResultOut"];
 export type JobError = S["JobError"];
 export type Health = S["HealthOut"];
+export type Limits = S["LimitsOut"];
 
 /** Fields accepted by POST /api/jobs (multipart/form-data). */
 export interface CreateJobRequest {

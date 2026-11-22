@@ -6,6 +6,7 @@ Local only: FakeComfyUI or mocked upstreams, loopback sockets, no tunnel, no GPU
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import json
 import time
 import tracemalloc
@@ -574,9 +575,9 @@ def test_a_stalled_client_is_cut_off_instead_of_buffering_without_bound(fake, mo
                 await collect(ws)
                 stall["on"] = True
                 fake.inject(CID, json.dumps({"type": "progress", "data": {"prompt_id": pid, "value": 1, "max": 2, "node": "3"}}))
-                released = await wait_until(lambda: not app.state.state["ws"] and not app.state.state["ws_tasks"], 8)
+                released = await wait_until(lambda: not app.state.state["ws"] and not app.state.state["ws_tasks"], 30)
                 stall["on"] = False
-                assert await wait_until(lambda: not fake._sockets.get(CID), 5), "the upstream socket was left open"
+                assert await wait_until(lambda: not fake._sockets.get(CID), 30), "the upstream socket was left open"
                 return released
     assert run(go()), "the proxy kept a stalled client connected"
 
@@ -704,7 +705,7 @@ def test_a_client_that_disconnects_mid_download_releases_the_upstream_and_the_sl
                         n += 1
                         if n == 3:
                             break                                                              # walk away
-            ok = await wait_until(lambda: stream.closed and app.state.state["inflight"] == 0 and app.state.state["heavy"] == 0, 8)
+            ok = await wait_until(lambda: stream.closed and app.state.state["inflight"] == 0 and app.state.state["heavy"] == 0, 30)
             return ok, stream.produced
     ok, produced = run(go())
     assert ok, "the upstream stream or the concurrency slot leaked after the client left"
@@ -723,7 +724,7 @@ def test_an_upstream_failure_midway_aborts_the_response_instead_of_looking_compl
                     async with c.stream("GET", VIEW, headers=AUTH) as r:
                         async for chunk in r.aiter_bytes(1024 * 1024):
                             got += len(chunk)
-            ok = await wait_until(lambda: stream.closed and app.state.state["inflight"] == 0, 5)
+            ok = await wait_until(lambda: stream.closed and app.state.state["inflight"] == 0, 30)
             return got, ok
     got, ok = run(go())
     assert got < 64 * 1024 * 1024 and ok
@@ -741,7 +742,7 @@ def test_the_total_download_time_limit_aborts_rather_than_truncating():
                     async with c.stream("GET", VIEW, headers=AUTH) as r:
                         async for _ in r.aiter_bytes(1024 * 1024):
                             pass
-            return await wait_until(lambda: stream.closed and app.state.state["inflight"] == 0, 5)
+            return await wait_until(lambda: stream.closed and app.state.state["inflight"] == 0, 30)
     assert run(go())
 
 
@@ -764,13 +765,33 @@ def test_download_slots_are_enforced_and_released():
                     await first.aiter_bytes(1024).__anext__()
                     second = await c.get(VIEW, headers=AUTH)
                     light = await c.get("/queue", headers=AUTH)                         # light calls are unaffected (upstream mock 200)
-                ok = await wait_until(lambda: app.state.state["heavy"] == 0, 5)
+                ok = await wait_until(lambda: app.state.state["heavy"] == 0, 30)
                 return second.status_code, light.status_code, ok
     second, light, ok = run(go())
     assert second == 429 and ok and light != 429
 
 
 # ====================================================================== the optional dead-man switch
+def wait_state(pred, timeout: float = 30.0) -> None:
+    """Wait for an observable state of the proxy (generous timeout: it only matters when something is wrong)."""
+    end = time.monotonic() + timeout
+    while not pred():
+        assert time.monotonic() < end, f"timed out after {timeout:g}s waiting for the proxy's state"
+        time.sleep(0.01)
+
+
+@contextmanager
+def ws_session(client, app, cid=CID):
+    """A TestClient WebSocket that is closed and FULLY torn down (the proxy's slot is released last) before the block exits. Starlette's
+    test client cancels the app the moment the block exits, which would otherwise race with the proxy's own teardown."""
+    with client.websocket_connect(f"/ws?clientId={cid}", headers=AUTH) as ws:
+        try:
+            yield ws
+        finally:
+            ws.close(1000)
+            wait_state(lambda: not app.state.state["ws"] and not app.state.state["ws_tasks"])
+
+
 def tick(client, app):
     return client.portal.call(app.state.dead_man_tick)
 
@@ -821,17 +842,12 @@ def test_a_silent_backend_gets_its_running_prompt_interrupted_with_a_targeted_ca
     with TestClient(app) as c:
         pid = new_id()
         assert c.post("/prompt", json=body_for(pid=pid), headers=AUTH).status_code == 200
-        deadline = time.monotonic() + 5
-        while fake._running != pid and time.monotonic() < deadline:
-            time.sleep(0.02)
+        fake.wait_running(pid)
         clock.t += 199
         assert tick(c, app) == 0                                    # not silent long enough
         clock.t += 2
         assert tick(c, app) == 1
-        deadline = time.monotonic() + 5
-        while not fake.interrupts and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert fake.interrupts == [pid]                              # targeted, never a global interrupt
+        assert fake.wait_interrupt() == [pid]                              # targeted, never a global interrupt
         assert c.post("/prompt", json=body_for(pid=pid), headers=AUTH).status_code == 409     # and it cannot be resubmitted
         assert tick(c, app) == 0
 
@@ -863,7 +879,7 @@ def test_a_live_backend_is_never_interrupted_for_a_long_job(fake):
             assert tick(c, app) == 0
         assert fake.interrupts == []
         clock.t += 1000                                              # silence, BUT a WebSocket is open
-        with c.websocket_connect(f"/ws?clientId={CID}", headers=AUTH):
+        with ws_session(c, app):
             assert tick(c, app) == 0
             clock.t += 10 ** 6
             assert tick(c, app) == 0
@@ -895,9 +911,7 @@ def test_it_only_touches_prompts_that_this_proxy_forwarded(fake):
         foreign = new_id()
         with httpx.Client(base_url=fake.url) as direct:
             direct.post("/prompt", json={"prompt": graph(), "client_id": "other", "prompt_id": foreign})
-        deadline = time.monotonic() + 5
-        while fake._running != foreign and time.monotonic() < deadline:
-            time.sleep(0.02)
+        fake.wait_running(foreign)
         clock.t += 10 ** 6
         assert tick(c, app) == 0 and fake.interrupts == []
 
@@ -908,9 +922,7 @@ def test_finished_prompts_are_left_alone(fake):
     with TestClient(app) as c:
         pid = new_id()
         c.post("/prompt", json=body_for(pid=pid), headers=AUTH)
-        deadline = time.monotonic() + 10
-        while pid not in fake.history and time.monotonic() < deadline:
-            time.sleep(0.02)
+        fake.wait_finished(pid)                                      # done AND out of the queue: only then is "finished" decidable
         clock.t += 10_000                                            # long silence, but inside the registry's 6 h memory
         assert tick(c, app) == 0 and fake.interrupts == [] and app.state.registry.entries[pid].finished is True
         assert app.state.registry.begin(pid, app.state.registry.entries[pid].digest, CLIENT)[0] == "accepted"   # still idempotent
@@ -940,9 +952,7 @@ def test_the_background_loop_reaps_an_orphan_and_leaves_an_active_backend_alone(
             c.get("/queue", headers=AUTH)
             time.sleep(0.3)
         assert fake.interrupts == []
-        deadline = time.monotonic() + 8                              # now it goes silent
-        while not fake.interrupts and time.monotonic() < deadline:
-            time.sleep(0.1)
+        fake.wait_interrupt(timeout=30)                              # now it goes silent
     assert fake.interrupts == [pid]
 
 
@@ -953,3 +963,43 @@ def test_stage_two_adds_no_tunnel_and_no_new_listening_surface():
     for forbidden in ("cloudflared", "trycloudflare", "ngrok", "0.0.0.0"):
         assert forbidden not in src.replace('"0.0.0.0"', "")
     assert 'proxy=None' in src and "ws://{host_port}" in src                                     # the upstream socket is loopback, no env proxy
+
+
+def test_a_handler_cancelled_in_the_middle_of_teardown_still_closes_the_upstream_socket_and_frees_the_slot(fake, monkeypatch):
+    """Regression: Starlette's test client (like a server shutdown) can cancel the handler while it is still closing the upstream socket.
+    The socket used to be left open (a ResourceWarning in a later test) and the slot depended on the close having completed."""
+    import types
+
+    class SlowUpstream:
+        aborted = False
+
+        def __init__(self):
+            self.transport = types.SimpleNamespace(abort=self._abort)
+
+        def _abort(self):
+            self.aborted = True
+
+        def __aiter__(self):
+            return self._events()
+
+        async def _events(self):
+            await asyncio.sleep(3600)
+            yield "never"
+
+        async def close(self):
+            await asyncio.sleep(3600)                                  # a close handshake that never completes
+
+    upstream = SlowUpstream()
+
+    async def fake_connect(*a, **k):
+        return upstream
+    monkeypatch.setattr(px, "ws_connect", fake_connect)
+    app = make_app(fake.url)
+    with TestClient(app) as c:
+        try:
+            with c.websocket_connect(f"/ws?clientId={CID}", headers=AUTH):
+                pass                                                   # leaving the block cancels the app mid-teardown
+        except BaseException:                                          # (the test client reports the cancellation)
+            pass
+        wait_state(lambda: not app.state.state["ws"] and not app.state.state["ws_tasks"])
+    assert upstream.aborted, "the upstream socket was not aborted after a cancelled teardown"

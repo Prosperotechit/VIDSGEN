@@ -1,9 +1,14 @@
 // Typed functions for every VIDSGEN API endpoint the UI uses.
 import { apiUrl, request } from "./client";
-import type { CreateJobRequest, Health, Job, JobList, JobStatus } from "./types";
+import type { CreateJobRequest, Health, Job, JobList, JobStatus, Limits } from "./types";
 
 export function getHealth(signal?: AbortSignal) {
   return request<Health>("/api/health", { signal, timeoutMs: 10_000 });
+}
+
+/** What this server will accept (modes, resolutions, frame/step/fps/guidance ranges, defaults). Read-only; independent of the GPU. */
+export function getLimits(signal?: AbortSignal) {
+  return request<Limits>("/api/limits", { signal, timeoutMs: 10_000 });
 }
 
 /** Builds the multipart body exactly as the backend's Form/File parameters expect. */

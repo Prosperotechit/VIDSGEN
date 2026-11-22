@@ -179,6 +179,7 @@ class FakeComfyUI:
         self.ws_auth_headers: list[str | None] = []
         self.ws_received: list[Any] = []     # frames clients sent to /ws
         # internals
+        self._cv = threading.Condition()     # notified on every observable state change (see wait_until)
         self._pending: list[str] = []
         self._running: str | None = None
         self._interrupt: set[str] = set()
@@ -239,6 +240,38 @@ class FakeComfyUI:
         self.paused = False
         if self._loop:
             self._loop.call_soon_threadsafe(self._wake.set)
+
+    # ------------------------------------------------------------------ deterministic synchronisation for tests
+    def _changed(self) -> None:
+        with self._cv:
+            self._cv.notify_all()
+
+    def wait_until(self, predicate, timeout: float = 30.0, what: str = "the expected state") -> None:
+        """Block until `predicate()` holds, waking on every state change. The generous timeout only matters when something is really
+        wrong; it never makes a passing test slower."""
+        end = time.monotonic() + timeout
+        with self._cv:
+            while not predicate():
+                left = end - time.monotonic()
+                assert left > 0, f"timed out after {timeout:g}s waiting for {what}"
+                self._cv.wait(min(left, 0.25))          # (the short wake-up also covers changes made without a notification)
+
+    def wait_running(self, pid: str, timeout: float = 30.0) -> None:
+        self.wait_until(lambda: self._running == pid, timeout, f"prompt {pid} to start running")
+
+    def wait_history(self, pid: str, timeout: float = 30.0) -> None:
+        self.wait_until(lambda: pid in self.history, timeout, f"prompt {pid} to reach the history")
+
+    def wait_finished(self, pid: str, timeout: float = 30.0) -> None:
+        """Finished AND gone from the queue (history is written a moment before the running slot is cleared)."""
+        self.wait_until(lambda: pid in self.history and self._running != pid and pid not in self._pending, timeout, f"prompt {pid} to finish")
+
+    def wait_pending(self, timeout: float = 30.0) -> None:
+        self.wait_until(lambda: bool(self._pending), timeout, "a prompt to be queued")
+
+    def wait_interrupt(self, count: int = 1, timeout: float = 30.0) -> list:
+        self.wait_until(lambda: len(self.interrupts) >= count, timeout, "an interrupt")
+        return list(self.interrupts)
 
     def inject(self, client_id: str, payload: str | bytes) -> None:
         """Send a raw frame (text or binary) to every socket of `client_id`, as ComfyUI would."""
@@ -364,6 +397,7 @@ class FakeComfyUI:
         self.prompts[pid] = {"graph": graph, "client_id": body.get("client_id"), "scenario": self._scenario(graph),
                              "number": self._number}
         self._pending.append(pid)
+        self._changed()
         self._wake.set()
         if mode == "queue_then_hang":        # the prompt IS queued, but the response never arrives (a lost response)
             await asyncio.sleep(3600)
@@ -386,6 +420,7 @@ class FakeComfyUI:
             if pid in self._pending:
                 self._pending.remove(pid)
                 self.deleted.append(pid)
+        self._changed()
         return Response(status_code=200)
 
     async def post_interrupt(self, request: Request):
@@ -395,6 +430,7 @@ class FakeComfyUI:
         target = body.get("prompt_id")
         if self._running and (target is None or target == self._running):
             self._interrupt.add(self._running)
+        self._changed()
         return Response(status_code=200)
 
     async def get_history(self, request: Request):
@@ -451,10 +487,12 @@ class FakeComfyUI:
                 await self._wake.wait()
             pid = self._pending.pop(0)
             self._running = pid
+            self._changed()
             try:
                 await self._execute(pid)
             finally:
                 self._running = None
+                self._changed()
 
     def _ts(self) -> int:
         return int(time.time() * 1000)
@@ -477,6 +515,7 @@ class FakeComfyUI:
                 self._interrupt.discard(pid)
                 await emit("execution_interrupted", {"node_id": node, "node_type": graph[node]["class_type"], "executed": []}, record=True)
                 self.history[pid] = {"prompt": [], "outputs": {}, "status": {"status_str": "error", "completed": False, "messages": msgs}, "meta": {}}
+                self._changed()
                 return True
             return False
 
@@ -496,6 +535,7 @@ class FakeComfyUI:
                    "traceback": ["  File \"/srv/ComfyUI/execution.py\", line 1, in x\n"], "current_inputs": {}, "current_outputs": {}}
             await emit("execution_error", err, record=True)
             self.history[pid] = {"prompt": [], "outputs": {}, "status": {"status_str": "error", "completed": False, "messages": msgs}, "meta": {}}
+            self._changed()
             return
         await emit("executing", {"node": "3", "display_node": "3"})
         steps = int(graph["3"]["inputs"]["steps"])
@@ -528,4 +568,5 @@ class FakeComfyUI:
         if outputs:
             await emit("executed", {"node": "58", "display_node": "58", "output": output})
         self.history[pid] = {"prompt": [], "outputs": outputs, "status": {"status_str": "success", "completed": True, "messages": msgs}, "meta": {}}
+        self._changed()
         await emit("execution_success", {"timestamp": self._ts()}, record=True)
